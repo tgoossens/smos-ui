@@ -546,6 +546,7 @@ def _extract_smos_view_data() -> dict:
     _ensure_defaults()
     files = _scan_smos_files(WORKFLOW_DIR)
     folders = _scan_smos_folders(WORKFLOW_DIR)
+    today = date.today()
 
     rel_files: list[str] = []
     tasks: list[dict] = []
@@ -564,21 +565,66 @@ def _extract_smos_view_data() -> dict:
         except Exception as exc:
             errors.append(f"{rel}: {exc}")
 
-    active = [t for t in tasks if t["state"] in SMOS_ACTIVE_STATES]
-    waiting = [t for t in tasks if t["state"] == "WAITING"]
-    done = [t for t in tasks if t["state"] in SMOS_TERMINAL_STATES]
+    for t in tasks:
+        due = t.get("due")
+        overdue = False
+        if due and t.get("state") not in SMOS_TERMINAL_STATES:
+            try:
+                overdue = datetime.fromisoformat(due).date() < today
+            except Exception:
+                overdue = False
+        t["overdue"] = overdue
 
+    # Shape expected by the rich UI (compatible with original dashboard GTD view)
+    projects: list[dict] = []
+    for rel in rel_files:
+        items = [t for t in tasks if t.get("file") == rel]
+        projects.append({"file": rel, "items": items})
+
+    next_actions = [t for t in tasks if t.get("state") in {"NEXT", "READY", "STARTED"}]
+    waiting = [t for t in tasks if t.get("state") == "WAITING"]
+    overdue = [t for t in tasks if t.get("overdue")]
+    quick_wins = sorted(
+        [t for t in tasks if t.get("state") in SMOS_ACTIVE_STATES and len((t.get("header") or "")) <= 60],
+        key=lambda x: (x.get("state") != "NEXT", x.get("due") or "9999-12-31", x.get("header") or ""),
+    )[:8]
+
+    board = {"TODO": [], "NEXT": [], "WAITING": [], "DONE": []}
+    for t in tasks:
+        s = (t.get("state") or "").upper()
+        if s in {"DONE", "CANCELLED", "FAILED"}:
+            board["DONE"].append(t)
+        elif s in {"NEXT", "READY", "STARTED"}:
+            board["NEXT"].append(t)
+        elif s == "WAITING":
+            board["WAITING"].append(t)
+        else:
+            board["TODO"].append(t)
+
+    timeline = [t for t in tasks if t.get("due") or t.get("scheduled")]
+    timeline.sort(key=lambda x: (x.get("due") or x.get("scheduled") or "9999-12-31", x.get("header") or ""))
+
+    # Keep "tasks" for API convenience, but expose rich UI keys too.
     return {
         "workflow_dir": str(WORKFLOW_DIR),
         "inbox_file": str(INBOX_FILE),
         "files": rel_files,
         "folders": folders,
         "tasks": tasks,
+        "projects": projects,
+        "today": {
+            "next_actions": next_actions,
+            "overdue": overdue,
+            "quick_wins": quick_wins,
+            "waiting": waiting,
+        },
+        "board": board,
+        "timeline": timeline,
         "stats": {
             "total": len(tasks),
-            "active": len(active),
+            "next": len(next_actions),
             "waiting": len(waiting),
-            "done": len(done),
+            "overdue": len(overdue),
             "files": len(rel_files),
         },
         "errors": errors,
@@ -871,7 +917,12 @@ async def gtd_data() -> JSONResponse:
 @app.get("/gtd/inbox")
 async def gtd_inbox() -> JSONResponse:
     data = _read_inbox_data()
-    return JSONResponse({"ok": True, **data, "count": len(data.get("inbox") or [])})
+    return JSONResponse({
+        "ok": True,
+        **data,
+        "file": data.get("path") or str(INBOX_FILE),
+        "count": len(data.get("inbox") or []),
+    })
 
 
 @app.post("/gtd/inbox/add")
@@ -1333,203 +1384,1860 @@ async def gtd_terminal_redirect(path: str = ""):
     target = f"http://127.0.0.1:{TERMINAL_PORT}{TERMINAL_BASE_PATH}{suffix}"
     return RedirectResponse(target)
 
+def _shared_gtd_header_css() -> str:
+    return """
+      .header { background: var(--header-bg, var(--panel, #111)); border-bottom: 1px solid var(--border, var(--line, #333)); padding: 16px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+      .header h1 { font-size: 20px; font-weight: 700; color: var(--accent, #d4843a); margin: 0; }
+      .countdown-pills { display: flex; gap: 12px; flex-wrap: wrap; }
+      .pill { background: var(--card, var(--chip, #252525)); border: 1px solid var(--border, var(--line, #333)); border-radius: 20px; padding: 4px 14px; font-size: 12px; color: var(--muted, #888); }
+      .pill strong { color: var(--text, #e8e0d4); }
+      .header .theme-toggle { border: 0; background: transparent; color: var(--text, #e8e0d4); font-size: 12px; font-weight: 600; cursor: pointer; padding: 0; }
+      @media (max-width: 860px) {
+        .header { padding: 12px 14px; gap: 10px; }
+        .header h1 { font-size: 18px; }
+        .countdown-pills { gap: 8px; }
+      }
+    """
+
+
+def _shared_gtd_header_html() -> str:
+    return (
+        "<div class='header'>"
+        "<h1>GTD Dashboard</h1>"
+        "<div class='countdown-pills'>"
+        "<div class='pill'><strong>Project-agnostic smos workflow</strong></div>"
+        "<a class='pill nav active' href='/gtd'><strong>GTD</strong></a>"
+        "<a class='pill nav' href='/gtd/terminal'><strong>Terminal</strong></a>"
+        "<div class='pill'><button type='button' id='themeToggle' class='theme-toggle'>☀️ Light mode</button></div>"
+        "</div></div>"
+    )
+
 
 @app.get("/", response_class=HTMLResponse)
-async def home() -> HTMLResponse:
-    html = """
-<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>smos-ui</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 20px; background:#0f1115; color:#e7eaf0; }
-    h1 { margin-top:0; }
-    .muted { color:#a5adba; font-size:14px; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
-    input, select, button, textarea {
-      background:#171b23; color:#e7eaf0; border:1px solid #2b3342; border-radius:8px; padding:8px;
-    }
-    button { cursor:pointer; }
-    .card { border:1px solid #2b3342; border-radius:12px; padding:12px; margin:12px 0; background:#121720; }
-    .task { border-bottom:1px solid #20293a; padding:8px 0; }
-    .pill { padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #2b3342; }
-    .state-NEXT,.state-READY,.state-STARTED { color:#8cd8ff; }
-    .state-WAITING { color:#ffd38c; }
-    .state-DONE,.state-CANCELLED,.state-FAILED { color:#89d185; }
-    .caps pre { white-space:pre-wrap; font-size:12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    textarea { width:100%; min-height:130px; }
-  </style>
-</head>
-<body>
-  <h1>smos-ui</h1>
-  <div class='muted'>Generic GTD UI over .smos files with native fallbacks.</div>
+@app.get("/gtd", response_class=HTMLResponse)
+async def gtd_view() -> HTMLResponse:
+    html_page = r"""
+    <!DOCTYPE html>
+    <html lang='en' data-theme='dark'>
+    <head>
+      <meta charset='UTF-8'>
+      <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+      <title>GTD</title>
+      <style>
+        :root {{ --bg:#14181f; --panel:#1d2532; --card:#1d2532; --line:#2f3a4d; --border:#2f3a4d; --text:#ecf1fa; --muted:#9fb0c9; --accent:#d4843a; --header-bg:#111722; }}
+        html[data-theme='light'], body.theme-light {{ --bg:#f3f6fb; --panel:#fff; --card:#fff; --line:#d7deec; --border:#d7deec; --text:#122038; --muted:#64758e; --accent:#b35f1f; --header-bg:#eaf0f8; }}
+        * {{ box-sizing:border-box; }}
+        body {{ margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
+        __SHARED_HEADER_CSS__
+        .main {{ max-width:1500px; margin:0 auto; padding:12px; }}
+        .top {{ display:grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap:8px; margin-bottom:10px; }}
+        .card {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }}
+        .n {{ font-size:26px; font-weight:700; }}
+        .muted {{ color:var(--muted); font-size:12px; }}
+        .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; position:sticky; top:72px; z-index:15; background:var(--bg); padding:8px 0; }}
+        button, input, select, textarea {{ font:inherit; }}
+        .btn {{ border:1px solid var(--line); background:var(--panel); color:var(--text); border-radius:10px; padding:8px 10px; cursor:pointer; min-height:40px; }}
+        .btn.primary {{ border-color:var(--accent); color:var(--accent); }}
+        .btn.icon-btn {{ padding:6px 8px; min-width:34px; line-height:1; }}
+        .grid {{ display:grid; grid-template-columns: 2fr 1fr; gap:10px; align-items:start; }}
+        .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }}
+        .title {{ font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin-bottom:8px; }}
+        .compact-row {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+        input,select,textarea {{ width:100%; background:transparent; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px; }}
+        .task-tree {{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
+        .task-row {{ display:flex; align-items:center; gap:8px; padding:8px; border-bottom:1px solid rgba(255,255,255,.05); }}
+        .task-row.todo-row {{ background:rgba(255,107,107,.08); border-left:3px solid #ff6b6b; }}
+        .task-row.selected-row {{ outline:1px solid var(--accent); outline-offset:-1px; background:rgba(212,132,58,.10); }}
+        .task-row:last-child {{ border-bottom:none; }}
+        .task-main {{ min-width:0; flex:1; display:flex; flex-direction:column; align-items:flex-start; gap:6px; }}
+        .task-line1 {{ width:100%; min-width:0; display:flex; align-items:center; gap:8px; }}
+        .task-line2 {{ width:100%; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
+        .task-file {{ font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }}
+        .toggle-btn {{ width:24px; height:24px; border-radius:6px; border:1px solid var(--line); background:transparent; color:var(--muted); cursor:pointer; }}
+        .toggle-btn.placeholder {{ visibility:hidden; }}
+        .task-header {{ font-size:14px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+        .task-header:hover {{ color:var(--accent); }}
+        .task-edit-input {{ max-width:520px; font-size:14px; padding:6px 8px; }}
+        .task-meta {{ font-size:11px; color:var(--muted); white-space:nowrap; }}
+        .task-date-pill {{ font-size:11px; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-weight:700; }}
+        .task-date-pill.deadline {{ border-color:#ef4444; color:#ef4444; }}
+        .task-date-pill.scheduled {{ border-color:#f59e0b; color:#f59e0b; }}
+        .task-actions {{ display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }}
+        .mobile-tools {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }}
+        .task-search {{ max-width:320px; }}
+        .filter-chips {{ display:flex; gap:6px; flex-wrap:wrap; }}
+        .filter-chip {{ border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); border-radius:999px; padding:6px 10px; font-size:12px; cursor:pointer; }}
+        .filter-chip.active {{ border-color:var(--accent); color:var(--accent); background:rgba(212,132,58,.14); }}
+        .state-current {{ box-shadow:0 0 0 1px rgba(255,255,255,.2) inset; }}
+        .chip {{ font-size:11px; border:1px solid var(--line); border-radius:999px; padding:3px 9px; cursor:pointer; color:#111; font-weight:600; }}
+        .chip:hover {{ filter:brightness(1.05); transform:translateY(-1px); }}
+        .chip-todo {{ background:#ff6b6b !important; border-color:#e95757 !important; }}
+        .chip-next {{ background:#ffb347 !important; border-color:#e39a38 !important; }}
+        .chip-ready {{ background:#ffb347 !important; border-color:#e39a38 !important; }}
+        .chip-waiting {{ background:#6fb8ff !important; border-color:#5ba5ec !important; }}
+        .chip-done {{ background:#78d68b !important; border-color:#63bc75 !important; }}
+        .chip-cancelled {{ background:#78d68b !important; border-color:#63bc75 !important; }}
+        .chip-action {{ background:rgba(255,255,255,.08); color:var(--text); border-color:var(--line); }}
+        .state-badge {{ font-size:11px; font-weight:700; border-radius:999px; padding:3px 8px; color:#111; border:1px solid rgba(0,0,0,.18); }}
+        .state-TODO {{ background:#ff6b6b; }}
+        .state-NEXT {{ background:#ffb347; }}
+        .state-WAITING {{ background:#6fb8ff; }}
+        .state-DONE, .state-CANCELLED, .state-FAILED {{ background:#78d68b; }}
+        .state-READY, .state-STARTED {{ background:#ffb347; }}
+        .state-EMPTY {{ background:#9aa8be; color:#101825; }}
+        .indent-line {{ display:inline-block; width:12px; height:1px; }}
+        .project-head {{ font-size:12px; color:var(--muted); padding:8px 10px; border-top:1px solid var(--line); background:rgba(0,0,0,.14); display:flex; align-items:center; gap:8px; }}
+        .project-head:first-child {{ border-top:none; }}
+        .keyboard-hint { font-size:11px; color:var(--muted); border:1px dashed var(--line); border-radius:8px; padding:8px; margin-top:8px; }
+        .date-modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; z-index:60; }
+        .date-modal-backdrop.open { display:flex; }
+        .date-modal { width:min(460px, 94vw); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }
+        .date-modal-title { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin-bottom:8px; }
+        .date-modal-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+        .date-quick-btn { border:1px solid var(--line); background:rgba(255,255,255,.04); color:var(--text); border-radius:999px; padding:5px 10px; cursor:pointer; }
+        .task-date-pill.clickable { cursor:pointer; }
+        pre { background:#0f141d; color:#d9e7ff; border:1px solid var(--line); border-radius:10px; padding:10px; overflow:auto; max-height:280px; }
+        .report-cards {{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
+        .report-row {{ padding:8px 10px; border-bottom:1px solid rgba(255,255,255,.06); }}
+        .report-row:last-child {{ border-bottom:none; }}
+        .report-title {{ font-size:13px; color:var(--text); }}
+        .report-meta {{ margin-top:4px; font-size:11px; color:var(--muted); display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
+        .report-state-chip {{ font-size:11px; border-radius:999px; padding:2px 8px; color:#111; font-weight:700; border:1px solid rgba(0,0,0,.18); }}
+        .report-text {{ border:1px solid var(--line); border-radius:10px; padding:8px 10px; background:#0f141d; max-height:300px; overflow:auto; }}
+        .report-line {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.45; color:#d9e7ff; padding:2px 0; white-space:pre-wrap; word-break:break-word; }}
+        .report-gap {{ height:6px; }}
+        .report-empty {{ color:var(--muted); padding:10px; font-size:12px; }}
+        .overdue {{ color:#ff6b6b; }}
+        .row {{ padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06); }}
+        .row:last-child {{ border-bottom:none; }}
+        .task {{ font-size:14px; }}
+        .chips {{ display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }}
+        .inbox-wrap {{ display:flex; flex-direction:column; gap:8px; }}
+        .inbox-head {{ display:flex; justify-content:space-between; align-items:center; gap:8px; }}
+        .inbox-count {{ font-size:11px; border-radius:999px; padding:2px 8px; border:1px solid var(--line); color:var(--muted); }}
+        .inbox-body {{ border:1px solid var(--line); border-radius:10px; padding:10px; min-height:160px; background:rgba(255,255,255,.02); }}
+        .inbox-text {{ font-size:15px; line-height:1.45; white-space:pre-wrap; }}
+        .inbox-empty {{ color:var(--muted); font-size:13px; }}
+        .inbox-nav {{ display:flex; justify-content:space-between; align-items:center; gap:8px; }}
+        .inbox-actions {{ display:flex; gap:8px; flex-wrap:wrap; }}
+        .btn.danger {{ border-color:#e95757; color:#ff8f8f; }}
+        .mobile-bottom-bar {{ display:none; }}
+        @media (max-width: 1100px) {{
+          .grid, .top {{ grid-template-columns:1fr; }}
+          .main {{ padding:10px; padding-bottom:88px; }}
+          .actions {{ top:110px; overflow:auto; flex-wrap:nowrap; white-space:nowrap; }}
+          .btn {{ min-height:44px; }}
+          .task-row {{ flex-direction:column; align-items:stretch; padding:10px; }}
+          .task-actions {{ margin-top:6px; justify-content:flex-start; overflow:auto; white-space:nowrap; }}
+          .task-actions {{ -webkit-overflow-scrolling:touch; scroll-snap-type:x proximity; touch-action:pan-x; }}
+          .task-actions .chip {{ scroll-snap-align:start; }}
+          .task-header {{ white-space:normal; overflow:visible; text-overflow:unset; }}
+          .compact-row {{ flex-direction:column; align-items:stretch; }}
+          .compact-row select, .compact-row input, .compact-row .btn {{ max-width:none !important; width:100%; }}
+          .task-search {{ max-width:none; width:100%; }}
+          .mobile-bottom-bar {{
+            position:fixed; left:0; right:0; bottom:0; z-index:30; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px;
+            padding:8px; background:var(--bg); border-top:1px solid var(--line);
+          }}
+          .mobile-bottom-bar .btn {{ width:100%; min-height:44px; font-size:12px; padding:8px 6px; }}
+        }}
+      </style>
+    </head>
+    <body>
+      __SHARED_HEADER_HTML__
+      <div class='main'>
+        <div style='margin-bottom:10px; padding:10px 12px; border-radius:10px; border:1px solid #6fb8ff; background:rgba(111,184,255,.14); color:#d9ecff; font-weight:600;'>
+          GTD keyboard build active, arrows navigate tree, TAB fold/unfold, SPACE cycle state.
+        </div>
+        <div class='top'>
+          <div class='card'><div class='n' id='st-total'>0</div><div class='muted'>Total tasks</div></div>
+          <div class='card'><div class='n' id='st-next'>0</div><div class='muted'>Next actions</div></div>
+          <div class='card'><div class='n' id='st-waiting'>0</div><div class='muted'>Waiting for</div></div>
+          <div class='card'><div class='n overdue' id='st-overdue'>0</div><div class='muted'>Overdue</div></div>
+        </div>
 
-  <div class='card caps'>
-    <div><strong>Capabilities</strong></div>
-    <pre id='caps'>loading...</pre>
-  </div>
+        <div class='actions'>
+          <button class='btn primary' onclick='openReport("next")'>Next action report</button>
+          <button class='btn primary' onclick='openReport("work")'>Work report</button>
+          <button class='btn primary' onclick='openReport("waiting")'>Waiting for report</button>
+          <button class='btn' onclick='undoDelete()'>Undo delete (Ctrl+Z)</button>
+          <button class='btn' onclick='refreshData()'>Refresh</button>
+        </div>
 
-  <div class='card'>
-    <div class='row'>
-      <select id='file'></select>
-      <input id='newTask' placeholder='New task header'>
-      <button onclick='addTask()'>Add task</button>
-      <button onclick='refresh()'>Refresh</button>
-      <button onclick='openReport("next")'>Report: next</button>
-      <button onclick='openReport("work")'>Report: work</button>
-      <button onclick='openReport("waiting")'>Report: waiting</button>
-      <button onclick='openReport("projects")'>Report: projects</button>
-      <button onclick='window.open("/gtd/terminal", "_blank")'>Terminal</button>
-    </div>
-    <div id='stats' class='muted'></div>
-    <div id='tasks'></div>
-  </div>
+        <div class='panel' style='margin-bottom:10px;'>
+          <div class='compact-row'>
+            <span class='muted'>State colors:</span>
+            <span class='chip chip-todo'>TODO</span>
+            <span class='chip chip-next'>NEXT</span>
+            <span class='chip chip-ready'>READY</span>
+            <span class='chip chip-waiting'>WAITING</span>
+            <span class='chip chip-done'>DONE</span>
+            <span class='chip chip-cancelled'>CANCELLED</span>
+          </div>
+        </div>
 
-  <div class='card'>
-    <div><strong>Inbox</strong></div>
-    <div class='row'>
-      <input id='inboxText' placeholder='Add inbox item'>
-      <button onclick='addInbox()'>Add</button>
-    </div>
-    <div id='inbox'></div>
-  </div>
+        <div class='grid'>
+          <div class='panel'>
+            <div class='title'>Smos-style task list</div>
+            <div class='muted' style='margin-bottom:8px;'>Build: __BUILD_STAMP__</div>
+            <div class='title'>Report output</div>
+            <div id='reportOut' class='report-empty' style='margin-bottom:10px;'>(click a report button)</div>
+            <div class='mobile-tools'>
+              <input id='taskSearch' class='task-search' placeholder='Search tasks, file, state, date...'>
+              <div class='filter-chips'>
+                <button type='button' class='filter-chip active' data-filter='ALL' onclick='setTaskFilter("ALL")'>All</button>
+                <button type='button' class='filter-chip' data-filter='TODO' onclick='setTaskFilter("TODO")'>TODO</button>
+                <button type='button' class='filter-chip' data-filter='NEXT' onclick='setTaskFilter("NEXT")'>NEXT</button>
+                <button type='button' class='filter-chip' data-filter='WAITING' onclick='setTaskFilter("WAITING")'>WAITING</button>
+                <button type='button' class='filter-chip' data-filter='DONE' onclick='setTaskFilter("DONE")'>DONE+</button>
+              </div>
+              <button class='btn' type='button' onclick='jumpToFile()'>Jump to file</button>
+            </div>
+            <div class='compact-row' style='margin-bottom:8px;'>
+              <select id='q-file' style='max-width:340px;'></select>
+              <select id='q-folder' style='max-width:240px;'></select>
+              <button class='btn icon-btn' title='Delete selected top-level folder' onclick='deleteSelectedFolder()'>🗑️</button>
+              <input id='q-header' placeholder='Add task to file root...' style='max-width:380px;'>
+              <button class='btn primary' onclick='quickCreateRoot()'>Add</button>
+              <button class='btn' onclick='collapseAll()'>Collapse all</button>
+              <button class='btn' onclick='expandAll()'>Expand all</button>
+            </div>
 
-  <div class='card'>
-    <div><strong>Report output</strong></div>
-    <textarea id='reportOut' class='mono' readonly></textarea>
-  </div>
+            <div class='task-tree' id='taskTree'></div>
 
-<script>
-let DATA = null;
-let INBOX = null;
+            <div class='keyboard-hint'>
+              Keyboard: ↑/↓ move, ←/→ collapse/expand or parent/child, TAB fold/unfold subtree, SPACE cycle state (incl. no-state), tw WAITING, td DONE, tn NEXT, tt TODO, tr READY, tc CANCELLED, sd DEADLINE date, ss SCHEDULED date (accept YYYY-MM-DD or +1d/+1w/+1m), e new sibling (or root on project row), E new child (or root on project row), n new .smos file (inline), N new folder, d/Del delete task (or delete selected .smos file when on project row, with confirmation), Esc cancels new inline creation, Ctrl+Z undo delete, Alt+↑/Alt+↓ jump between levels, Home/End go top/bottom.
+            </div>
+          </div>
 
-async function api(url, opts) {
-  const r = await fetch(url, opts || {});
-  const ct = r.headers.get('content-type') || '';
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || (r.status + ' ' + r.statusText));
-  }
-  if (ct.includes('application/json')) return r.json();
-  return r.text();
-}
+          <div class='panel'>
+            <div class='inbox-wrap'>
+              <div class='inbox-head'>
+                <div class='title' style='margin-bottom:0;'>Assistant inbox</div>
+                <span id='inboxCount' class='inbox-count'>0 items</span>
+              </div>
+              <div id='inboxFile' class='muted'></div>
+              <div id='inboxBody' class='inbox-body'>
+                <div id='inboxText' class='inbox-text' style='display:none;'></div>
+                <div id='inboxEmpty' class='inbox-empty'>Inbox is empty.</div>
+              </div>
+              <div class='inbox-nav'>
+                <button class='btn' type='button' onclick='inboxPrev()'>Prev</button>
+                <span id='inboxPos' class='muted'>0 / 0</span>
+                <button class='btn' type='button' onclick='inboxNext()'>Next</button>
+              </div>
+              <div class='inbox-actions'>
+                <button class='btn primary' type='button' onclick='inboxResolve("done")'>Check done</button>
+                <button class='btn danger' type='button' onclick='inboxResolve("remove")'>Remove</button>
+              </div>
+            </div>
+          </div>
+        </div>
 
-function esc(s) {
-  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-async function refresh() {
-  DATA = await api('/gtd/data');
-  document.getElementById('caps').textContent = JSON.stringify(DATA.capabilities || {}, null, 2);
-
-  const fileSel = document.getElementById('file');
-  const old = fileSel.value;
-  fileSel.innerHTML = (DATA.files || []).map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
-  if (old && [...fileSel.options].some(o => o.value === old)) fileSel.value = old;
-
-  const st = DATA.stats || {};
-  document.getElementById('stats').textContent =
-    `files=${st.files||0}, total=${st.total||0}, active=${st.active||0}, waiting=${st.waiting||0}, done=${st.done||0}`;
-
-  const tasks = (DATA.tasks || []).map(t => {
-    const indent = '&nbsp;'.repeat((t.level || 0) * 4);
-    const state = t.state || '-';
-    return `<div class='task'>
-      <div>${indent}<span class='pill state-${esc(state)}'>${esc(state)}</span> <strong>${esc(t.header)}</strong>
-      <span class='muted'>(${esc(t.file)})</span></div>
-      <div class='row'>
-        <select onchange='setState("${esc(t.id)}", this.value)'>
-          ${['','TODO','NEXT','READY','STARTED','WAITING','DONE','CANCELLED','FAILED'].map(s =>
-            `<option value="${s}" ${s===state?'selected':''}>${s||'(no-state)'}</option>`).join('')}
-        </select>
-        <button onclick='delTask("${esc(t.id)}")'>Delete</button>
+        <div class='mobile-bottom-bar'>
+          <button class='btn primary' type='button' onclick='mobileQuickAdd()'>Add</button>
+          <button class='btn' type='button' onclick='collapseAll()'>Collapse</button>
+          <button class='btn' type='button' onclick='expandAll()'>Expand</button>
+          <button class='btn' type='button' onclick='jumpToFile()'>Jump</button>
+        </div>
       </div>
-    </div>`;
-  }).join('');
 
-  document.getElementById('tasks').innerHTML = tasks || '<div class="muted">No tasks.</div>';
+      <div id='dateModalBackdrop' class='date-modal-backdrop' onclick='if(event.target===this) closeDateEditor()'>
+        <div class='date-modal' onclick='event.stopPropagation()'>
+          <div id='dateModalTitle' class='date-modal-title'>Edit date</div>
+          <div class='date-modal-row'>
+            <input id='dateModalInput' placeholder='YYYY-MM-DD or +1d / +1w / +1m'>
+          </div>
+          <div class='date-modal-row'>
+            <input id='dateModalPicker' type='date'>
+          </div>
+          <div class='date-modal-row'>
+            <button type='button' class='date-quick-btn' onclick="applyDateQuick('+1d')">+1d</button>
+            <button type='button' class='date-quick-btn' onclick="applyDateQuick('+1w')">+1w</button>
+            <button type='button' class='date-quick-btn' onclick="applyDateQuick('+1m')">+1m</button>
+            <button type='button' class='date-quick-btn' onclick='setDateToday()'>today</button>
+          </div>
+          <div class='date-modal-row' style='justify-content:flex-end;'>
+            <button type='button' class='btn' onclick='clearDateEditorValue()'>Clear</button>
+            <button type='button' class='btn' onclick='closeDateEditor()'>Cancel</button>
+            <button type='button' class='btn primary' onclick='saveDateEditor()'>Save</button>
+          </div>
+          <div class='muted'>Tip: enter relative values like +2d, +2w, +2m.</div>
+        </div>
+      </div>
 
-  INBOX = await api('/gtd/inbox');
-  renderInbox();
-}
+      <script>
+        function esc(s) { return (s ?? '').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+        let DATA = null;
+        let COLLAPSED = new Set();
+        let COLLAPSE_INIT = false;
+        let selectedTaskId = null;
+        let visibleTaskOrder = [];
+        let visibleTaskMeta = new Map();
+        let shouldRestoreTaskFocus = true;
+        let editingTaskId = null;
+        let inlineEditSaving = false;
+        let reportInitialized = false;
+        let taskFilter = 'ALL';
+        let taskSearch = '';
+        let UNDO_DELETE_STACK = [];
+        let INBOX_DATA = { inbox: [], count: 0, file: '' };
+        let INBOX_INDEX = 0;
+        let pendingStatePrefix = null;
+        let pendingStateTimer = null;
+        let pendingDatePrefix = null;
+        let pendingDateTimer = null;
+        let dateEditContext = null;
+        let pendingNewTaskId = null;
+        let pendingNewFile = null;
+        let editingProjectFile = null;
+        let inlineProjectEditSaving = false;
 
-function renderInbox() {
-  const items = (INBOX && INBOX.inbox) || [];
-  document.getElementById('inbox').innerHTML = items.map(x =>
-    `<div class='row'><span>${esc(x.text)}</span>
-      <button onclick='resolveInbox("${esc(x.id)}","done")'>Done</button>
-      <button onclick='resolveInbox("${esc(x.id)}","remove")'>Remove</button>
-    </div>`
-  ).join('') || '<div class="muted">Inbox empty.</div>';
-}
+        async function api(path, opts={}) {
+          const r = await fetch(path, {headers: {'Content-Type':'application/json'}, ...opts});
+          if (!r.ok) throw new Error(await r.text());
+          const ct = r.headers.get('content-type') || '';
+          return ct.includes('application/json') ? r.json() : r.text();
+        }
 
-async function addTask() {
-  const file = document.getElementById('file').value;
-  const header = document.getElementById('newTask').value.trim();
-  if (!file || !header) return;
-  await api('/gtd/task/create', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({file, header})
-  });
-  document.getElementById('newTask').value = '';
-  await refresh();
-}
+        function setTheme(theme) {
+          const t = theme === 'light' ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+          if (document.body) {
+            document.body.classList.remove('theme-light', 'theme-dark');
+            document.body.classList.add(`theme-${t}`);
+          }
+          try {
+            localStorage.setItem('gtd-theme', t);
+            localStorage.setItem('dashboard-theme', t);
+          } catch (e) {}
+          const headerBtn = document.getElementById('themeToggle');
+          if (headerBtn) headerBtn.textContent = t === 'light' ? '🌙 Dark mode' : '☀️ Light mode';
+        }
 
-async function setState(id, state) {
-  await api('/gtd/task/state', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({id, state})
-  });
-  await refresh();
-}
+        function toggleTheme() {
+          const current = document.documentElement.getAttribute('data-theme') || 'dark';
+          setTheme(current === 'dark' ? 'light' : 'dark');
+        }
 
-async function delTask(id) {
-  await api('/gtd/task/delete', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({id})
-  });
-  await refresh();
-}
+        function initTheme() {
+          let saved = null;
+          try {
+            saved = localStorage.getItem('dashboard-theme') || localStorage.getItem('gtd-theme');
+          } catch (e) {}
+          setTheme(saved || 'dark');
+          const headerBtn = document.getElementById('themeToggle');
+          if (headerBtn && !headerBtn.dataset.boundThemeToggle) {
+            headerBtn.addEventListener('click', toggleTheme);
+            headerBtn.dataset.boundThemeToggle = '1';
+          }
+        }
 
-async function addInbox() {
-  const text = document.getElementById('inboxText').value.trim();
-  if (!text) return;
-  await api('/gtd/inbox/add', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({text})
-  });
-  document.getElementById('inboxText').value = '';
-  INBOX = await api('/gtd/inbox');
-  renderInbox();
-}
+        function idFrom(file, path) { return `${file}::${path.join('.')}`; }
+        function projectInputId(file) { return `inline-project-edit-${encodeURIComponent(file).replace(/%/g, '_')}`; }
 
-async function resolveInbox(id, action) {
-  await api('/gtd/inbox/resolve', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({id, action})
-  });
-  INBOX = await api('/gtd/inbox');
-  renderInbox();
-}
+        function fmtDateLocal(d) {
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, '0');
+          const day = String(d.getDate()).padStart(2, '0');
+          return `${y}-${m}-${day}`;
+        }
 
-async function openReport(kind) {
-  const txt = await api('/gtd/report/' + encodeURIComponent(kind));
-  document.getElementById('reportOut').value = txt;
-}
+        function parseAbsoluteDate(raw) {
+          const s = String(raw || '').trim();
+          const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+          if (!m) return null;
+          const y = Number(m[1]);
+          const mo = Number(m[2]);
+          const d = Number(m[3]);
+          const dt = new Date(y, mo - 1, d);
+          if (dt.getFullYear() !== y || dt.getMonth() !== (mo - 1) || dt.getDate() !== d) return null;
+          return fmtDateLocal(dt);
+        }
 
-refresh().catch(e => {
-  document.getElementById('caps').textContent = String(e);
-});
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(html)
+        function addMonthsClamped(base, months) {
+          const y = base.getFullYear();
+          const m0 = base.getMonth();
+          const d0 = base.getDate();
+          const total = m0 + months;
+          const ny = y + Math.floor(total / 12);
+          const nm = ((total % 12) + 12) % 12;
+          const last = new Date(ny, nm + 1, 0).getDate();
+          const nd = Math.min(d0, last);
+          return new Date(ny, nm, nd);
+        }
+
+        function parseRelativeDate(raw, baseDate = new Date()) {
+          const s = String(raw || '').trim().toLowerCase();
+          const m = s.match(/^\+(\d+)\s*([dwm])$/);
+          if (!m) return null;
+          const n = Number(m[1]);
+          const unit = m[2];
+          if (!Number.isFinite(n) || n < 0) return null;
+          const b = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate());
+          let out;
+          if (unit === 'd') out = new Date(b.getFullYear(), b.getMonth(), b.getDate() + n);
+          else if (unit === 'w') out = new Date(b.getFullYear(), b.getMonth(), b.getDate() + (n * 7));
+          else out = addMonthsClamped(b, n);
+          return fmtDateLocal(out);
+        }
+
+        function resolveDateInput(raw) {
+          const s = String(raw || '').trim();
+          if (!s) return { ok: true, value: null };
+          const rel = parseRelativeDate(s);
+          if (rel) return { ok: true, value: rel };
+          const abs = parseAbsoluteDate(s);
+          if (abs) return { ok: true, value: abs };
+          return { ok: false, value: null };
+        }
+
+        function getTaskById(id) {
+          const all = (DATA && DATA.projects ? DATA.projects.flatMap(p => p.items || []) : []);
+          return all.find(x => x.id === id) || null;
+        }
+
+        function openDateEditor(id, field) {
+          const t = getTaskById(id);
+          if (!t) return;
+          const key = field === 'scheduled' ? 'scheduled' : 'due';
+          dateEditContext = { id, field: key };
+          const current = key === 'scheduled' ? (t.scheduled || '') : (t.due || '');
+
+          const backdrop = document.getElementById('dateModalBackdrop');
+          const title = document.getElementById('dateModalTitle');
+          const input = document.getElementById('dateModalInput');
+          const picker = document.getElementById('dateModalPicker');
+          if (!backdrop || !title || !input || !picker) return;
+
+          title.textContent = `${key === 'scheduled' ? 'SCHEDULED' : 'DEADLINE'} · ${t.header || '(no title)'}`;
+          input.value = current;
+          picker.value = current;
+          backdrop.classList.add('open');
+          requestAnimationFrame(() => { input.focus(); input.select(); });
+        }
+
+        function closeDateEditor() {
+          dateEditContext = null;
+          const backdrop = document.getElementById('dateModalBackdrop');
+          if (backdrop) backdrop.classList.remove('open');
+        }
+
+        function setDateToday() {
+          const v = fmtDateLocal(new Date());
+          const input = document.getElementById('dateModalInput');
+          const picker = document.getElementById('dateModalPicker');
+          if (input) input.value = v;
+          if (picker) picker.value = v;
+        }
+
+        function applyDateQuick(spec) {
+          const resolved = parseRelativeDate(spec);
+          if (!resolved) return;
+          const input = document.getElementById('dateModalInput');
+          const picker = document.getElementById('dateModalPicker');
+          if (input) input.value = spec;
+          if (picker) picker.value = resolved;
+        }
+
+        function clearDateEditorValue() {
+          const input = document.getElementById('dateModalInput');
+          const picker = document.getElementById('dateModalPicker');
+          if (input) input.value = '';
+          if (picker) picker.value = '';
+        }
+
+        async function saveDateEditor() {
+          if (!dateEditContext || !dateEditContext.id) return;
+          const input = document.getElementById('dateModalInput');
+          const picker = document.getElementById('dateModalPicker');
+          const rawInput = String(input ? input.value : '').trim();
+          const raw = rawInput || String(picker ? picker.value : '').trim();
+          const parsed = resolveDateInput(raw);
+          if (!parsed.ok) {
+            alert('Invalid date. Use YYYY-MM-DD or +Nd/+Nw/+Nm (for example +2d, +1w, +1m).');
+            return;
+          }
+          const payload = { id: dateEditContext.id };
+          if (dateEditContext.field === 'scheduled') payload.scheduled = parsed.value;
+          else payload.due = parsed.value;
+
+          selectedTaskId = dateEditContext.id;
+          shouldRestoreTaskFocus = true;
+          await api('/gtd/task/update', {method:'POST', body: JSON.stringify(payload)});
+          closeDateEditor();
+          await refreshData();
+        }
+
+        function renderToday() {
+          const box = document.getElementById('today-next');
+          const items = DATA.today.next_actions.slice(0,8);
+          const overdue = DATA.today.overdue.slice(0,4);
+          const quick = DATA.today.quick_wins.slice(0,4);
+          box.innerHTML = `
+            <div class='muted' style='margin-bottom:8px;'>Next actions</div>
+            ${items.map(t => taskRow(t)).join('') || "<div class='muted'>No next actions.</div>"}
+            <div class='muted' style='margin:8px 0;'>Overdue</div>
+            ${overdue.map(t => taskRow(t,true)).join('') || "<div class='muted'>No overdue tasks.</div>"}
+            <div class='muted' style='margin:8px 0;'>Quick wins</div>
+            ${quick.map(t => taskRow(t)).join('') || "<div class='muted'>No quick wins.</div>"}
+          `;
+        }
+
+        function taskRow(t, red=false) {
+          return `<div class='row'>
+            <div class='task ${red?'overdue':''}>${esc(t.header)}${t.overdue?" <span class='overdue'>●</span>":''}</div>
+            <div class='muted'>${esc(t.file)} · ${esc((t.state || '').toUpperCase() || '—')}${t.due?` · deadline ${esc(t.due)}`:''}${t.scheduled?` · scheduled ${esc(t.scheduled)}`:''}</div>
+          </div>`;
+        }
+
+        function badgeClass(state) {
+          const s = (state || '').toUpperCase();
+          if (!s) return 'state-badge state-EMPTY';
+          return `state-badge state-${s}`;
+        }
+
+        function chipClassForState(state) {
+          const s = (state || '').toUpperCase();
+          if (!s) return 'chip-action';
+          if (s === 'NEXT') return 'chip-next';
+          if (s === 'READY' || s === 'STARTED') return 'chip-ready';
+          if (s === 'WAITING') return 'chip-waiting';
+          if (s === 'DONE' || s === 'FAILED') return 'chip-done';
+          if (s === 'CANCELLED') return 'chip-cancelled';
+          return 'chip-todo';
+        }
+
+        function reportStateClass(state) {
+          const s = (state || '').toUpperCase();
+          if (!s) return 'state-EMPTY';
+          if (s === 'NEXT' || s === 'READY' || s === 'STARTED') return 'state-NEXT';
+          if (s === 'WAITING') return 'state-WAITING';
+          if (s === 'DONE' || s === 'CANCELLED' || s === 'FAILED') return 'state-DONE';
+          return 'state-TODO';
+        }
+
+        function buildChildrenMap(items) {
+          const children = new Map();
+          for (const t of items) children.set(t.id, []);
+          for (const t of items) {
+            if (!t.path || t.path.length <= 1) continue;
+            const parentId = idFrom(t.file, t.path.slice(0, -1));
+            if (children.has(parentId)) children.get(parentId).push(t);
+          }
+          return children;
+        }
+
+        function sortByPath(items) {
+          const order = { NEXT: 0, WAITING: 1, TODO: 2, DONE: 3, CANCELLED: 4, FAILED: 5 };
+          const normalized = (state) => {
+            const s = (state || '').toUpperCase();
+            if (s === 'READY' || s === 'STARTED') return 'NEXT';
+            return s;
+          };
+          const pathCmp = (a,b) => {
+            const pa = a.path || [];
+            const pb = b.path || [];
+            const n = Math.min(pa.length, pb.length);
+            for (let i=0;i<n;i++) { if (pa[i] !== pb[i]) return pa[i]-pb[i]; }
+            return pa.length - pb.length;
+          };
+          return items.slice().sort((a,b) => {
+            const ra = order[normalized(a.state)] ?? 99;
+            const rb = order[normalized(b.state)] ?? 99;
+            if (ra !== rb) return ra - rb;
+            return pathCmp(a,b);
+          });
+        }
+
+        function projectKey(file) {
+          return `project::${file}`;
+        }
+
+        function folderKey(folder) {
+          return `folder::${folder}`;
+        }
+
+        function parentFolderOfFile(file) {
+          const parts = String(file || '').split('/').filter(Boolean);
+          return parts.length > 1 ? parts[0] : '';
+        }
+
+        function taskIdFromPath(file, path) {
+          return `${file}::${(path || []).join('.')}`;
+        }
+
+        function expandFirstLevelSubtrees(file) {
+          const project = (DATA.projects || []).find(p => p.file === file);
+          if (!project) return;
+          for (const t of (project.items || [])) {
+            if (Array.isArray(t.path) && t.path.length === 1) {
+              COLLAPSED.delete(t.id);
+            }
+          }
+        }
+
+        function normalizeStateForFilter(state) {
+          const s = (state || '').toUpperCase();
+          if (s === 'READY' || s === 'STARTED') return 'NEXT';
+          if (s === 'CANCELLED' || s === 'FAILED') return 'DONE';
+          return s || '';
+        }
+
+        function itemMatchesFilters(t) {
+          const ns = normalizeStateForFilter(t.state);
+          if (taskFilter !== 'ALL') {
+            if (taskFilter === 'DONE') {
+              if (!['DONE', 'CANCELLED', 'FAILED'].includes((t.state || '').toUpperCase())) return false;
+            } else if (ns !== taskFilter) {
+              return false;
+            }
+          }
+          if (!taskSearch) return true;
+          const hay = [
+            t.header || '',
+            t.file || '',
+            (t.state || '').toUpperCase(),
+            t.due || '',
+            t.scheduled || '',
+          ].join(' ').toLowerCase();
+          return hay.includes(taskSearch);
+        }
+
+        function filterProjectItemsForView(items) {
+          const src = items || [];
+          const matched = src.filter(itemMatchesFilters);
+          if (!matched.length) return [];
+          const byId = new Map(src.map(t => [t.id, t]));
+          const keep = new Set();
+          for (const t of matched) {
+            keep.add(t.id);
+            let curPath = Array.isArray(t.path) ? t.path.slice(0, -1) : [];
+            while (curPath.length) {
+              const pid = taskIdFromPath(t.file, curPath);
+              if (!byId.has(pid) || keep.has(pid)) break;
+              keep.add(pid);
+              curPath = curPath.slice(0, -1);
+            }
+          }
+          return src.filter(t => keep.has(t.id));
+        }
+
+        function setTaskFilter(filter) {
+          taskFilter = filter || 'ALL';
+          for (const el of document.querySelectorAll('.filter-chip[data-filter]')) {
+            el.classList.toggle('active', el.getAttribute('data-filter') === taskFilter);
+          }
+          selectedTaskId = null;
+          renderTree();
+        }
+
+        function focusTaskById(id) {
+          if (!id) return;
+          const root = document.getElementById('taskTree');
+          const row = root ? root.querySelector(`.task-row[data-task-id="${CSS.escape(id)}"]`) : null;
+          if (!row) return;
+          row.scrollIntoView({block:'nearest'});
+          row.focus();
+        }
+
+        function ensureSelectedVisible() {
+          if (selectedTaskId && visibleTaskOrder.includes(selectedTaskId)) return;
+          selectedTaskId = visibleTaskOrder[0] || null;
+        }
+
+        function renderTaskNode(t, childrenMap, indent, acc) {
+          const kid = sortByPath(childrenMap.get(t.id) || []);
+          const hasChild = kid.length > 0;
+          const open = !COLLAPSED.has(t.id);
+          const isTodo = (t.state || '').toUpperCase() === 'TODO';
+          const tabIndex = selectedTaskId === t.id ? 0 : -1;
+          const parentId = (t.path && t.path.length > 1) ? taskIdFromPath(t.file, t.path.slice(0, -1)) : null;
+          const firstChildId = hasChild ? kid[0].id : null;
+          const isEditing = editingTaskId === t.id;
+          const canDelegate = !['WAITING', 'DONE', 'CANCELLED', 'FAILED'].includes((t.state || '').toUpperCase());
+          const line2PadPx = (Math.max(0, indent) * 12) + 40;
+
+          visibleTaskOrder.push(t.id);
+          visibleTaskMeta.set(t.id, {
+            id: t.id,
+            type: 'task',
+            file: t.file,
+            path: t.path || [],
+            parentId,
+            hasChild,
+            open,
+            firstChildId,
+            state: (t.state || '').toUpperCase(),
+          });
+
+          acc.push(`<div class='task-row ${isTodo ? 'todo-row' : ''} ${selectedTaskId === t.id ? 'selected-row' : ''}' data-task-id='${esc(t.id)}' tabindex='${tabIndex}' onclick='selectTask("${esc(t.id)}")'>
+            <div class='task-main'>
+              <div class='task-line1'>
+                <span>${'<span class="indent-line"></span>'.repeat(Math.max(0, indent))}</span>
+                <button class='toggle-btn ${hasChild ? '' : 'placeholder'}' ${!hasChild ? 'tabindex="-1"' : ''} onclick='event.stopPropagation(); toggleNode("${esc(t.id)}")'>${hasChild ? (open ? '▾' : '▸') : '•'}</button>
+                <span class='${badgeClass(t.state)}'>${esc((t.state || '').toUpperCase() || '—')}</span>
+                ${isEditing
+                  ? `<input id='inline-edit-${esc(t.id)}' class='task-edit-input' value='${esc(t.header || '')}' onclick='event.stopPropagation()' onkeydown='handleInlineEditKeydown(event,"${esc(t.id)}")' onblur='saveInlineEdit("${esc(t.id)}")' />`
+                  : `<span class='task-header' onclick='event.stopPropagation(); startInlineEdit("${esc(t.id)}")'>${esc(t.header || '(no title)')}</span>`}
+              </div>
+              ${(t.due || t.scheduled) ? `<div class='task-line2' style='padding-left:${line2PadPx}px;'>
+                ${t.due ? `<span class='task-date-pill clickable deadline ${t.overdue ? 'overdue' : ''}' onclick='event.stopPropagation(); openDateEditor("${esc(t.id)}","due")'>DEADLINE ${esc(t.due)}</span>` : ''}
+                ${t.scheduled ? `<span class='task-date-pill clickable scheduled' onclick='event.stopPropagation(); openDateEditor("${esc(t.id)}","scheduled")'>SCHEDULED ${esc(t.scheduled)}</span>` : ''}
+              </div>` : ''}
+            </div>
+            <div class='task-actions'>
+              <span class='chip chip-action' onclick='event.stopPropagation(); openDateEditor("${esc(t.id)}","due")'>📅 due</span>
+              <span class='chip chip-action' onclick='event.stopPropagation(); openDateEditor("${esc(t.id)}","scheduled")'>🗓 sched</span>
+              ${canDelegate ? `<span class='chip chip-action' onclick='event.stopPropagation(); delegateTask("${esc(t.id)}")'>delegate</span>` : ''}
+            </div>
+          </div>`);
+
+          if (hasChild && open) {
+            for (const c of kid) {
+              renderTaskNode(c, childrenMap, indent + 1, acc);
+            }
+          }
+        }
+
+        function renderTree() {
+          const root = document.getElementById('taskTree');
+          const blocks = [];
+          visibleTaskOrder = [];
+          visibleTaskMeta = new Map();
+          const rawProjects = (DATA.projects || []).slice().sort((a,b) => String(a.file || '').localeCompare(String(b.file || '')));
+          const topFiles = [];
+          const folderMap = new Map();
+
+          for (const p of rawProjects) {
+            const folder = parentFolderOfFile(p.file);
+            if (!folder) {
+              topFiles.push(p);
+              continue;
+            }
+            if (!folderMap.has(folder)) folderMap.set(folder, []);
+            folderMap.get(folder).push(p);
+          }
+
+          const folderNames = Array.from(folderMap.keys()).sort((a,b) => a.localeCompare(b));
+
+          function renderFileProject(p, baseIndent=0) {
+            const items = filterProjectItemsForView(p.items || []);
+            const topLevel = items.filter(t => t.path && t.path.length === 1);
+
+            const projectOpen = !COLLAPSED.has(projectKey(p.file));
+            const nextCount = (p.items || []).filter(t => itemMatchesFilters(t) && ['NEXT','READY','STARTED'].includes((t.state || '').toUpperCase())).length;
+            const todoBadge = nextCount > 0 ? `<span class='state-badge state-NEXT'>${nextCount} NEXT</span>` : '';
+            const pKey = projectKey(p.file);
+            const projectEditing = editingProjectFile === p.file;
+            const displayName = baseIndent > 0 ? String(p.file).split('/').slice(1).join('/') : p.file;
+            const projectInput = projectEditing
+              ? `<input id='${projectInputId(p.file)}' class='task-edit-input' value='${esc(p.file)}' onclick='event.stopPropagation()' onkeydown='handleInlineProjectEditKeydown(event,"${esc(p.file)}")' onblur='saveInlineProjectEdit("${esc(p.file)}")' />`
+              : `<strong>${esc(displayName)}</strong>`;
+            const firstChildId = topLevel.length ? sortByPath(topLevel)[0].id : null;
+
+            visibleTaskOrder.push(pKey);
+            visibleTaskMeta.set(pKey, {
+              id: pKey,
+              type: 'project',
+              file: p.file,
+              path: [],
+              parentId: baseIndent > 0 ? folderKey(parentFolderOfFile(p.file)) : null,
+              hasChild: topLevel.length > 0,
+              open: projectOpen,
+              firstChildId,
+              state: '',
+            });
+
+            const pTabIndex = selectedTaskId === pKey ? 0 : -1;
+            blocks.push(`<div class='project-head task-row ${selectedTaskId === pKey ? 'selected-row' : ''}' data-task-id='${esc(pKey)}' tabindex='${pTabIndex}' onclick='selectTask("${esc(pKey)}")'>
+              <button class='toggle-btn' onclick='toggleProject("${esc(p.file)}")'>${projectOpen ? '▾' : '▸'}</button>
+              <span>${'<span class="indent-line"></span>'.repeat(Math.max(0, baseIndent))}</span>
+              ${projectInput}
+              <span class='muted'>${items.length} tasks</span>
+              ${todoBadge}
+            </div>`);
+
+            if (!projectOpen) return;
+            const childrenMap = buildChildrenMap(items);
+            for (const t of sortByPath(topLevel)) {
+              renderTaskNode(t, childrenMap, baseIndent, blocks);
+            }
+          }
+
+          for (const p of topFiles) renderFileProject(p, 0);
+
+          for (const folder of folderNames) {
+            const files = (folderMap.get(folder) || []).slice().sort((a,b) => String(a.file || '').localeCompare(String(b.file || '')));
+            const fKey = folderKey(folder);
+            const folderOpen = !COLLAPSED.has(fKey);
+            const firstChildId = files.length ? projectKey(files[0].file) : null;
+
+            visibleTaskOrder.push(fKey);
+            visibleTaskMeta.set(fKey, {
+              id: fKey,
+              type: 'folder',
+              folder,
+              file: '',
+              path: [],
+              parentId: null,
+              hasChild: files.length > 0,
+              open: folderOpen,
+              firstChildId,
+              state: '',
+            });
+
+            const fTabIndex = selectedTaskId === fKey ? 0 : -1;
+            blocks.push(`<div class='project-head task-row ${selectedTaskId === fKey ? 'selected-row' : ''}' data-task-id='${esc(fKey)}' tabindex='${fTabIndex}' onclick='selectTask("${esc(fKey)}")'>
+              <button class='toggle-btn' onclick='toggleFolder("${esc(folder)}")'>${folderOpen ? '▾' : '▸'}</button>
+              <strong>${esc(folder)}</strong>
+              <span class='muted'>${files.length} files</span>
+            </div>`);
+
+            if (!folderOpen) continue;
+            for (const p of files) renderFileProject(p, 1);
+          }
+
+          ensureSelectedVisible();
+
+          // Rebuild row tab-index with selected id after the visibility pass.
+          const html = blocks.join('');
+          root.innerHTML = html || "<div class='muted' style='padding:10px;'>No tasks match current filter/search.</div>";
+
+          for (const row of root.querySelectorAll('.task-row[data-task-id]')) {
+            const tid = row.getAttribute('data-task-id');
+            row.setAttribute('tabindex', tid === selectedTaskId ? '0' : '-1');
+          }
+
+          if (shouldRestoreTaskFocus && selectedTaskId) {
+            requestAnimationFrame(() => focusTaskById(selectedTaskId));
+            shouldRestoreTaskFocus = false;
+          }
+
+          if (editingProjectFile) {
+            requestAnimationFrame(() => {
+              const el = document.getElementById(projectInputId(editingProjectFile));
+              if (el) { el.focus(); el.select(); }
+            });
+          }
+        }
+
+        function renderTimeline() {
+          const box = document.getElementById('timeline');
+          box.innerHTML = DATA.timeline.slice(0,28).map(t => `<div class='row'><div class='task'>${esc(t.header)}</div><div class='muted'>${t.due?('DEADLINE '+esc(t.due)):''} ${t.scheduled?(' · SCHEDULED '+esc(t.scheduled)):''} · ${esc((t.state || '').toUpperCase() || '—')} · ${esc(t.file)}</div></div>`).join('') || "<div class='muted'>No timeline items.</div>";
+        }
+
+        function fillFiles() {
+          const sel = document.getElementById('q-file');
+          sel.innerHTML = DATA.files.map(f => `<option value='${esc(f)}'>${esc(f)}</option>`).join('');
+        }
+
+        function jumpToFile() {
+          if (!DATA || !Array.isArray(DATA.files) || !DATA.files.length) return;
+          const current = document.getElementById('q-file')?.value || DATA.files[0];
+          const query = prompt('Jump to file (type part of file name):', current || '');
+          if (query === null) return;
+          const q = query.trim().toLowerCase();
+          const match = DATA.files.find(f => !q || f.toLowerCase().includes(q));
+          if (!match) {
+            alert('No file match found.');
+            return;
+          }
+          const fileSel = document.getElementById('q-file');
+          if (fileSel) fileSel.value = match;
+          COLLAPSED.delete(projectKey(match));
+          selectedTaskId = projectKey(match);
+          shouldRestoreTaskFocus = true;
+          renderTree();
+        }
+
+        async function mobileQuickAdd() {
+          const file = document.getElementById('q-file')?.value || (DATA.files && DATA.files[0]) || '';
+          if (!file) return;
+          const header = prompt('Task title', '');
+          if (header === null || !header.trim()) return;
+          await api('/gtd/task/create', {
+            method:'POST',
+            body: JSON.stringify({ file, header: header.trim() })
+          });
+          await refreshData();
+        }
+
+        function fillFolders() {
+          const sel = document.getElementById('q-folder');
+          const folders = (DATA.folders || []);
+          sel.innerHTML = folders.length
+            ? folders.map(f => `<option value='${esc(f)}'>📁 ${esc(f)}</option>`).join('')
+            : "<option value=''>No folders</option>";
+        }
+
+        async function deleteFolderByName(folder, askConfirm=true) {
+          const clean = String(folder || '').trim();
+          if (!clean) return;
+          if (askConfirm && !confirm(`Move folder to trash?\n\n${clean}`)) return;
+          await api('/gtd/folder/delete', {method:'POST', body: JSON.stringify({folder: clean})});
+          await refreshData();
+        }
+
+        function nearestProjectKeyByFile(file) {
+          const files = (DATA && DATA.projects ? DATA.projects.map(p => p.file) : []);
+          if (!files.length) return null;
+          const idx = files.indexOf(file);
+          if (idx < 0) return projectKey(files[0]);
+          for (let i = idx + 1; i < files.length; i++) {
+            if (files[i] !== file) return projectKey(files[i]);
+          }
+          for (let i = idx - 1; i >= 0; i--) {
+            if (files[i] !== file) return projectKey(files[i]);
+          }
+          return null;
+        }
+
+        function nearestVisibleRowId(fromId) {
+          const order = visibleTaskOrder || [];
+          if (!order.length) return null;
+          const idx = order.indexOf(fromId);
+          if (idx < 0) return order[0];
+          for (let i = idx + 1; i < order.length; i++) {
+            if (order[i] !== fromId) return order[i];
+          }
+          for (let i = idx - 1; i >= 0; i--) {
+            if (order[i] !== fromId) return order[i];
+          }
+          return null;
+        }
+
+        async function deleteProjectFileByHotkey(file) {
+          const relFile = String(file || '').trim();
+          if (!relFile) return;
+          if (!confirm(`Delete this .smos file?\n\n${relFile}\n\nThis cannot be undone from the UI.`)) return;
+          selectedTaskId = nearestProjectKeyByFile(relFile);
+          shouldRestoreTaskFocus = true;
+          await api('/gtd/file/delete', {method:'POST', body: JSON.stringify({file: relFile, force: true})});
+          await refreshData();
+        }
+
+        async function deleteSelectedFolder() {
+          const sel = document.getElementById('q-folder');
+          const folder = (sel && sel.value) ? sel.value.trim() : '';
+          await deleteFolderByName(folder, true);
+        }
+
+        async function createFolderPrompt() {
+          const name = prompt('New folder name (top-level)', '');
+          if (name === null) return;
+          const clean = String(name || '').trim();
+          if (!clean) return;
+          await api('/gtd/folder/create', {method:'POST', body: JSON.stringify({name: clean})});
+          await refreshData();
+          const sel = document.getElementById('q-folder');
+          if (sel) sel.value = clean;
+        }
+
+        function suggestNewFilePath() {
+          const folderSel = document.getElementById('q-folder');
+          const folder = (folderSel && folderSel.value) ? String(folderSel.value).trim() : '';
+          const prefix = folder ? `${folder}/` : '';
+          const used = new Set((DATA && DATA.files) ? DATA.files : []);
+          for (let i = 1; i < 999; i++) {
+            const cand = `${prefix}new-file-${i}.smos`;
+            if (!used.has(cand)) return cand;
+          }
+          return `${prefix}new-file-${Date.now()}.smos`;
+        }
+
+        async function createFileInline() {
+          const res = await api('/gtd/file/create', {method:'POST', body: JSON.stringify({file: suggestNewFilePath()})});
+          await refreshData();
+          if (res && res.file) {
+            const fileSel = document.getElementById('q-file');
+            if (fileSel) fileSel.value = res.file;
+            COLLAPSED.delete(projectKey(res.file));
+            const pf = parentFolderOfFile(res.file);
+            if (pf) COLLAPSED.delete(folderKey(pf));
+            selectedTaskId = projectKey(res.file);
+            startInlineProjectEdit(res.file, true);
+          }
+        }
+
+        async function createFilePrompt() {
+          await createFileInline();
+        }
+
+        function currentInboxItem() {
+          const items = (INBOX_DATA && INBOX_DATA.inbox) || [];
+          if (!items.length) return null;
+          const idx = Math.max(0, Math.min(INBOX_INDEX, items.length - 1));
+          INBOX_INDEX = idx;
+          return items[idx];
+        }
+
+        function renderInbox() {
+          const countEl = document.getElementById('inboxCount');
+          const fileEl = document.getElementById('inboxFile');
+          const textEl = document.getElementById('inboxText');
+          const emptyEl = document.getElementById('inboxEmpty');
+          const posEl = document.getElementById('inboxPos');
+          if (!countEl || !fileEl || !textEl || !emptyEl || !posEl) return;
+
+          const items = (INBOX_DATA && INBOX_DATA.inbox) || [];
+          const count = items.length;
+          countEl.textContent = `${count} item${count === 1 ? '' : 's'}`;
+          fileEl.textContent = INBOX_DATA && INBOX_DATA.file ? `File: ${INBOX_DATA.file}` : '';
+
+          if (!count) {
+            textEl.style.display = 'none';
+            emptyEl.style.display = 'block';
+            posEl.textContent = '0 / 0';
+            return;
+          }
+
+          const item = currentInboxItem();
+          textEl.textContent = item ? item.text : '';
+          textEl.style.display = 'block';
+          emptyEl.style.display = 'none';
+          posEl.textContent = `${INBOX_INDEX + 1} / ${count}`;
+        }
+
+        async function fetchInbox() {
+          INBOX_DATA = await api('/gtd/inbox');
+          const count = (INBOX_DATA && INBOX_DATA.inbox ? INBOX_DATA.inbox.length : 0);
+          if (INBOX_INDEX >= count) INBOX_INDEX = Math.max(0, count - 1);
+          renderInbox();
+        }
+
+        function inboxPrev() {
+          const items = (INBOX_DATA && INBOX_DATA.inbox) || [];
+          if (!items.length) return;
+          INBOX_INDEX = Math.max(0, INBOX_INDEX - 1);
+          renderInbox();
+        }
+
+        function inboxNext() {
+          const items = (INBOX_DATA && INBOX_DATA.inbox) || [];
+          if (!items.length) return;
+          INBOX_INDEX = Math.min(items.length - 1, INBOX_INDEX + 1);
+          renderInbox();
+        }
+
+        async function inboxResolve(action) {
+          const item = currentInboxItem();
+          if (!item) return;
+          await api('/gtd/inbox/resolve', {method:'POST', body: JSON.stringify({id: item.id, action})});
+          const currentLen = ((INBOX_DATA && INBOX_DATA.inbox) || []).length;
+          if (INBOX_INDEX >= currentLen - 1) INBOX_INDEX = Math.max(0, INBOX_INDEX - 1);
+          await fetchInbox();
+        }
+
+        async function refreshData() {
+          DATA = await api('/gtd/data');
+          if (!COLLAPSE_INIT) {
+            for (const p of DATA.projects) {
+              COLLAPSED.add(projectKey(p.file));
+              const pf = parentFolderOfFile(p.file);
+              if (pf) COLLAPSED.add(folderKey(pf));
+            }
+            const all = DATA.projects.flatMap(p => p.items || []);
+            for (const t of all) COLLAPSED.add(t.id);
+            COLLAPSE_INIT = true;
+          }
+          document.getElementById('st-total').textContent = DATA.stats.total;
+          document.getElementById('st-next').textContent = DATA.stats.next;
+          document.getElementById('st-waiting').textContent = DATA.stats.waiting;
+          document.getElementById('st-overdue').textContent = DATA.stats.overdue;
+          fillFiles(); fillFolders(); renderTree();
+          await fetchInbox();
+          if (!reportInitialized) {
+            reportInitialized = true;
+            openReport('next');
+          }
+        }
+
+        async function quickCreateRoot() {
+          const payload = {
+            header: document.getElementById('q-header').value,
+            file: document.getElementById('q-file').value,
+          };
+          if (!payload.file) return alert('Please select a file');
+          if (!payload.header.trim()) return alert('Please enter a task');
+          await api('/gtd/task/create', {method:'POST', body: JSON.stringify(payload)});
+          document.getElementById('q-header').value='';
+          await refreshData();
+        }
+
+        async function setState(id, state, preserveFocus=false) {
+          if (preserveFocus) {
+            selectedTaskId = id;
+            shouldRestoreTaskFocus = true;
+          }
+          const sendState = (state === '' || state === null || state === undefined) ? '__NONE__' : state;
+          await api('/gtd/task/state', {method:'POST', body: JSON.stringify({id, state: sendState})});
+          await refreshData();
+        }
+
+        async function delegateTask(id) {
+          if (!id) return;
+          const targetEmail = String(prompt('Delegate to email address') || '').trim();
+          if (!targetEmail) return;
+          const targetName = String(prompt('Delegate to name (optional)') || '').trim();
+          selectedTaskId = id;
+          shouldRestoreTaskFocus = true;
+          try {
+            await api('/gtd/task/delegate', {
+              method:'POST',
+              body: JSON.stringify({id, target_email: targetEmail, target_name: targetName})
+            });
+            await refreshData();
+          } catch (e) {
+            alert('Delegation failed: ' + e.message);
+          }
+        }
+
+        async function deleteTask(id, pushUndo=true) {
+          if (!id) return;
+          selectedTaskId = nearestVisibleRowId(id);
+          shouldRestoreTaskFocus = true;
+          const res = await api('/gtd/task/delete', {method:'POST', body: JSON.stringify({id})});
+          if (pushUndo && res && res.undo) {
+            UNDO_DELETE_STACK.push(res.undo);
+            if (UNDO_DELETE_STACK.length > 20) UNDO_DELETE_STACK.shift();
+          }
+          await refreshData();
+        }
+
+        async function deleteFile(relFile) {
+          if (!relFile) return;
+          await api('/gtd/file/delete', {method:'POST', body: JSON.stringify({file: relFile})});
+          await refreshData();
+        }
+
+        async function undoDelete() {
+          const snap = UNDO_DELETE_STACK.pop();
+          if (!snap) return;
+          const res = await api('/gtd/task/restore', {method:'POST', body: JSON.stringify(snap)});
+          if (res && res.id) {
+            selectedTaskId = res.id;
+            shouldRestoreTaskFocus = true;
+          }
+          await refreshData();
+        }
+
+        async function quickEdit(id) {
+          const all = DATA.projects.flatMap(p => p.items || []);
+          const t = all.find(x => x.id === id);
+          if (!t) return;
+          const header = prompt('Task title', t.header || '');
+          if (header === null) return;
+          const due = prompt('Due date YYYY-MM-DD (empty to clear)', t.due || '');
+          if (due === null) return;
+          await api('/gtd/task/update', {method:'POST', body: JSON.stringify({id, header, due})});
+          await refreshData();
+        }
+
+        function startInlineEdit(id, asNew=false) {
+          editingTaskId = id;
+          if (asNew) pendingNewTaskId = id;
+          shouldRestoreTaskFocus = false;
+          renderTree();
+          requestAnimationFrame(() => {
+            const el = document.getElementById(`inline-edit-${id}`);
+            if (el) { el.focus(); el.select(); }
+          });
+        }
+
+        function cancelInlineEdit() {
+          editingTaskId = null;
+          pendingNewTaskId = null;
+          inlineEditSaving = false;
+          shouldRestoreTaskFocus = true;
+          renderTree();
+        }
+
+        async function cancelNewTaskInline(id) {
+          editingTaskId = null;
+          pendingNewTaskId = null;
+          inlineEditSaving = false;
+          await deleteTask(id, false);
+        }
+
+        async function saveInlineEdit(id) {
+          if (inlineEditSaving || editingTaskId !== id) return;
+          const el = document.getElementById(`inline-edit-${id}`);
+          if (!el) return cancelInlineEdit();
+          const header = (el.value || '').trim();
+          if (!header) {
+            if (id === pendingNewTaskId) {
+              await cancelNewTaskInline(id);
+              return;
+            }
+            return cancelInlineEdit();
+          }
+          inlineEditSaving = true;
+          try {
+            await api('/gtd/task/update', {method:'POST', body: JSON.stringify({id, header})});
+            editingTaskId = null;
+            if (pendingNewTaskId === id) pendingNewTaskId = null;
+            selectedTaskId = id;
+            shouldRestoreTaskFocus = true;
+            await refreshData();
+          } finally {
+            inlineEditSaving = false;
+          }
+        }
+
+        function handleInlineEditKeydown(ev, id) {
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            saveInlineEdit(id);
+            return;
+          }
+          if (ev.key === 'Escape') {
+            ev.preventDefault();
+            if (id === pendingNewTaskId) {
+              cancelNewTaskInline(id);
+            } else {
+              cancelInlineEdit();
+            }
+            return;
+          }
+        }
+
+        function startInlineProjectEdit(file, isNew=false) {
+          editingProjectFile = file;
+          if (isNew) pendingNewFile = file;
+          shouldRestoreTaskFocus = false;
+          renderTree();
+        }
+
+        async function cancelInlineProjectEdit(file) {
+          const oldFile = file || editingProjectFile;
+          editingProjectFile = null;
+          inlineProjectEditSaving = false;
+          if (oldFile && pendingNewFile === oldFile) {
+            pendingNewFile = null;
+            await deleteFile(oldFile);
+            return;
+          }
+          pendingNewFile = null;
+          shouldRestoreTaskFocus = true;
+          renderTree();
+        }
+
+        async function saveInlineProjectEdit(oldFile) {
+          if (!oldFile || inlineProjectEditSaving || editingProjectFile !== oldFile) return;
+          const el = document.getElementById(projectInputId(oldFile));
+          if (!el) return cancelInlineProjectEdit(oldFile);
+          const next = String(el.value || '').trim();
+          if (!next) {
+            await cancelInlineProjectEdit(oldFile);
+            return;
+          }
+
+          if (next === oldFile || next === oldFile.replace(/\.smos$/i, '')) {
+            editingProjectFile = null;
+            if (pendingNewFile === oldFile) pendingNewFile = null;
+            selectedTaskId = projectKey(oldFile);
+            shouldRestoreTaskFocus = true;
+            renderTree();
+            return;
+          }
+
+          inlineProjectEditSaving = true;
+          try {
+            const res = await api('/gtd/file/rename', {
+              method:'POST',
+              body: JSON.stringify({old_file: oldFile, new_file: next}),
+            });
+            editingProjectFile = null;
+            pendingNewFile = null;
+            if (res && res.file) {
+              selectedTaskId = projectKey(res.file);
+              COLLAPSED.delete(projectKey(res.file));
+            }
+            shouldRestoreTaskFocus = true;
+            await refreshData();
+          } finally {
+            inlineProjectEditSaving = false;
+          }
+        }
+
+        function handleInlineProjectEditKeydown(ev, oldFile) {
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            saveInlineProjectEdit(oldFile);
+            return;
+          }
+          if (ev.key === 'Escape') {
+            ev.preventDefault();
+            cancelInlineProjectEdit(oldFile);
+            return;
+          }
+        }
+
+        function selectTask(id, focus=false) {
+          if (!id) return;
+          selectedTaskId = id;
+          const meta = visibleTaskMeta.get(id);
+          const fileSel = document.getElementById('q-file');
+          if (meta && meta.file && fileSel) fileSel.value = meta.file;
+          const root = document.getElementById('taskTree');
+          if (root) {
+            for (const row of root.querySelectorAll('.task-row[data-task-id]')) {
+              const tid = row.getAttribute('data-task-id');
+              row.setAttribute('tabindex', tid === selectedTaskId ? '0' : '-1');
+              if (tid === selectedTaskId) row.classList.add('selected-row');
+              else row.classList.remove('selected-row');
+            }
+          }
+          if (focus) focusTaskById(id);
+        }
+
+        function cycleState(state, backwards=false) {
+          const order = ['', 'TODO', 'NEXT', 'READY', 'WAITING', 'DONE', 'CANCELLED'];
+          const current = (state || '').toUpperCase();
+          const idx = order.indexOf(current);
+          const i = idx >= 0 ? idx : 0;
+          const nextIndex = backwards
+            ? (i - 1 + order.length) % order.length
+            : (i + 1) % order.length;
+          return order[nextIndex];
+        }
+
+        function clearPendingStatePrefix() {
+          pendingStatePrefix = null;
+          if (pendingStateTimer) {
+            clearTimeout(pendingStateTimer);
+            pendingStateTimer = null;
+          }
+        }
+
+        function armStatePrefix(prefix) {
+          pendingStatePrefix = prefix;
+          if (pendingStateTimer) clearTimeout(pendingStateTimer);
+          pendingStateTimer = setTimeout(() => {
+            pendingStatePrefix = null;
+            pendingStateTimer = null;
+          }, 1200);
+        }
+
+        function clearPendingDatePrefix() {
+          pendingDatePrefix = null;
+          if (pendingDateTimer) {
+            clearTimeout(pendingDateTimer);
+            pendingDateTimer = null;
+          }
+        }
+
+        function armDatePrefix(prefix) {
+          pendingDatePrefix = prefix;
+          if (pendingDateTimer) clearTimeout(pendingDateTimer);
+          pendingDateTimer = setTimeout(() => {
+            pendingDatePrefix = null;
+            pendingDateTimer = null;
+          }, 1200);
+        }
+
+        function moveSelection(delta) {
+          if (!visibleTaskOrder.length) return;
+          const current = selectedTaskId && visibleTaskOrder.includes(selectedTaskId)
+            ? visibleTaskOrder.indexOf(selectedTaskId)
+            : 0;
+          const next = Math.max(0, Math.min(visibleTaskOrder.length - 1, current + delta));
+          if (next === current && ((delta < 0 && current === 0) || (delta > 0 && current === visibleTaskOrder.length - 1))) {
+            if (switchFileByDelta(delta)) return;
+          }
+          selectedTaskId = visibleTaskOrder[next];
+          selectTask(selectedTaskId, true);
+        }
+
+        function firstTaskIdInFile(file) {
+          const project = (DATA.projects || []).find(p => p.file === file);
+          if (!project) return null;
+          const items = sortByPath(filterProjectItemsForView(project.items || []));
+          return items.length ? items[0].id : null;
+        }
+
+        function lastTaskIdInFile(file) {
+          const project = (DATA.projects || []).find(p => p.file === file);
+          if (!project) return null;
+          const items = sortByPath(filterProjectItemsForView(project.items || []));
+          return items.length ? items[items.length - 1].id : null;
+        }
+
+        function switchFileByDelta(delta) {
+          if (!DATA || !Array.isArray(DATA.projects) || !DATA.projects.length) return false;
+          const files = DATA.projects.map(p => p.file);
+          if (!files.length) return false;
+
+          let currentFile = null;
+          const selectedMeta = selectedTaskId ? visibleTaskMeta.get(selectedTaskId) : null;
+          if (selectedMeta) currentFile = selectedMeta.file;
+          if (!currentFile) {
+            const fileSel = document.getElementById('q-file');
+            currentFile = (fileSel && fileSel.value) ? fileSel.value : files[0];
+          }
+
+          let idx = files.indexOf(currentFile);
+          if (idx < 0) idx = 0;
+          const step = delta > 0 ? 1 : -1;
+          for (let i = idx + step; i >= 0 && i < files.length; i += step) {
+            const file = files[i];
+            const targetId = step > 0 ? firstTaskIdInFile(file) : lastTaskIdInFile(file);
+            if (!targetId) continue;
+            COLLAPSED.delete(projectKey(file));
+            selectedTaskId = targetId;
+            shouldRestoreTaskFocus = true;
+            renderTree();
+            return true;
+          }
+          return false;
+        }
+
+        function expandChainToTask(id) {
+          const meta = visibleTaskMeta.get(id);
+          if (!meta) return;
+          let p = meta.parentId;
+          while (p) {
+            COLLAPSED.delete(p);
+            const pm = visibleTaskMeta.get(p);
+            p = pm ? pm.parentId : null;
+          }
+          COLLAPSED.delete(projectKey(meta.file));
+          const pf = parentFolderOfFile(meta.file);
+          if (pf) COLLAPSED.delete(folderKey(pf));
+        }
+
+        function expandToTaskId(taskId) {
+          const [file, rawPath] = String(taskId || '').split('::');
+          if (!file || !rawPath) return;
+          COLLAPSED.delete(projectKey(file));
+          const pf = parentFolderOfFile(file);
+          if (pf) COLLAPSED.delete(folderKey(pf));
+          const parts = rawPath.split('.').map(x => Number(x)).filter(n => Number.isInteger(n) && n >= 0);
+          if (!parts.length) return;
+          for (let i = 1; i < parts.length; i++) {
+            const parentId = `${file}::${parts.slice(0, i).join('.')}`;
+            COLLAPSED.delete(parentId);
+          }
+        }
+
+        function jumpLevel(delta) {
+          if (!selectedTaskId || !visibleTaskOrder.length) return;
+          const curMeta = visibleTaskMeta.get(selectedTaskId);
+          if (!curMeta) return;
+          const targetDepth = Math.max(0, (curMeta.path || []).length - 1 + delta);
+          const curIdx = visibleTaskOrder.indexOf(selectedTaskId);
+          let bestId = null;
+
+          for (let i = curIdx + 1; i < visibleTaskOrder.length; i++) {
+            const id = visibleTaskOrder[i];
+            const m = visibleTaskMeta.get(id);
+            if (!m) continue;
+            const d = Math.max(0, (m.path || []).length - 1);
+            if (d === targetDepth) { bestId = id; break; }
+          }
+          if (!bestId) {
+            for (let i = curIdx - 1; i >= 0; i--) {
+              const id = visibleTaskOrder[i];
+              const m = visibleTaskMeta.get(id);
+              if (!m) continue;
+              const d = Math.max(0, (m.path || []).length - 1);
+              if (d === targetDepth) { bestId = id; break; }
+            }
+          }
+          if (!bestId) return;
+          selectedTaskId = bestId;
+          expandChainToTask(bestId);
+          shouldRestoreTaskFocus = true;
+          renderTree();
+        }
+
+        function toggleNode(id) {
+          selectedTaskId = id;
+          shouldRestoreTaskFocus = true;
+          if (COLLAPSED.has(id)) COLLAPSED.delete(id); else COLLAPSED.add(id);
+          renderTree();
+        }
+
+        function toggleProject(file) {
+          const key = projectKey(file);
+          shouldRestoreTaskFocus = true;
+          if (COLLAPSED.has(key)) {
+            COLLAPSED.delete(key);
+            expandFirstLevelSubtrees(file);
+          } else {
+            COLLAPSED.add(key);
+          }
+          renderTree();
+        }
+
+        function toggleFolder(folder) {
+          const key = folderKey(folder);
+          shouldRestoreTaskFocus = true;
+          if (COLLAPSED.has(key)) COLLAPSED.delete(key); else COLLAPSED.add(key);
+          renderTree();
+        }
+
+        function collapseAll() {
+          for (const p of DATA.projects) {
+            COLLAPSED.add(projectKey(p.file));
+            const pf = parentFolderOfFile(p.file);
+            if (pf) COLLAPSED.add(folderKey(pf));
+          }
+          const all = DATA.projects.flatMap(p => p.items || []);
+          for (const t of all) COLLAPSED.add(t.id);
+          renderTree();
+        }
+
+        function expandAll() {
+          COLLAPSED.clear();
+          renderTree();
+        }
+
+        async function addNear(targetId, mode) {
+          const header = prompt(mode === 'child' ? 'Subtask title' : 'Sibling task title', '');
+          if (header === null || !header.trim()) return;
+          const relFile = targetId.split('::')[0];
+          await api('/gtd/task/create', {
+            method:'POST',
+            body: JSON.stringify({ file: relFile, header: header.trim(), target_id: targetId, mode })
+          });
+          await refreshData();
+        }
+
+        async function addNearInline(targetId, mode) {
+          const relFile = targetId.split('::')[0];
+          const res = await api('/gtd/task/create', {
+            method:'POST',
+            body: JSON.stringify({ file: relFile, header: 'new task', target_id: targetId, mode })
+          });
+          await refreshData();
+          if (res && res.id) {
+            expandToTaskId(res.id);
+            selectedTaskId = res.id;
+            startInlineEdit(res.id, true);
+          }
+        }
+
+        async function addRootInline(file) {
+          if (!file) return;
+          const res = await api('/gtd/task/create', {
+            method:'POST',
+            body: JSON.stringify({ file, header: 'new task' })
+          });
+          await refreshData();
+          if (res && res.id) {
+            COLLAPSED.delete(projectKey(file));
+            const pf = parentFolderOfFile(file);
+            if (pf) COLLAPSED.delete(folderKey(pf));
+            selectedTaskId = res.id;
+            startInlineEdit(res.id, true);
+          }
+        }
+
+        function formatReportText(txt) {
+          const lines = String(txt || '').split('\\n');
+          return lines.map((raw) => {
+            if (!raw.trim()) return "<div class='report-gap'></div>";
+            let line = esc(raw);
+            line = line.replace(/\\b(TODO|NEXT|WAITING|DONE|CANCELLED|FAILED|READY|STARTED)\\b/g, (m) => {
+              return `<span class='report-state-chip ${reportStateClass(m)}'>${m}</span>`;
+            });
+            line = line.replace(/\\bDEADLINE\\b(?:\\s+\\d{4}-\\d{2}-\\d{2})?/g, (m) => `<span class='task-date-pill deadline'>${m}</span>`);
+            line = line.replace(/\\bSCHEDULED\\b(?:\\s+\\d{4}-\\d{2}-\\d{2})?/g, (m) => `<span class='task-date-pill scheduled'>${m}</span>`);
+            return `<div class='report-line'>${line}</div>`;
+          }).join('');
+        }
+
+        async function openReport(kind) {
+          const out = document.getElementById('reportOut');
+          out.className = 'report-empty';
+          out.textContent = 'Loading report...';
+          try {
+            const txt = await api(`/gtd/report/${kind}`);
+            if (!String(txt || '').trim()) {
+              out.className = 'report-empty';
+              out.textContent = 'No items.';
+              return;
+            }
+            out.className = 'report-text';
+            out.innerHTML = formatReportText(txt);
+          } catch (e) {
+            out.className = 'report-empty';
+            out.textContent = 'Error: ' + e;
+          }
+        }
+
+        function handleTreeKeydown(ev) {
+          if (editingTaskId || editingProjectFile) return;
+          const row = ev.target.closest('.task-row[data-task-id]');
+          if (!row) return;
+          const id = row.getAttribute('data-task-id');
+          if (!id) return;
+          selectTask(id, false);
+
+          const meta = visibleTaskMeta.get(id);
+          if (!meta) return;
+
+          if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && meta.type === 'task') {
+            const k = String(ev.key || '');
+            const kl = k.toLowerCase();
+
+            if (pendingStatePrefix === 't') {
+              const map = { w: 'WAITING', d: 'DONE', n: 'NEXT', t: 'TODO', r: 'READY', c: 'CANCELLED' };
+              if (map[kl]) {
+                ev.preventDefault();
+                clearPendingStatePrefix();
+                clearPendingDatePrefix();
+                setState(id, map[kl], true);
+                return;
+              }
+              clearPendingStatePrefix();
+            }
+
+            if (pendingDatePrefix === 's') {
+              if (kl === 'd' || kl === 's') {
+                ev.preventDefault();
+                clearPendingDatePrefix();
+                clearPendingStatePrefix();
+                openDateEditor(id, kl === 'd' ? 'due' : 'scheduled');
+                return;
+              }
+              clearPendingDatePrefix();
+            }
+
+            if (k === 't' || k === 'T') {
+              ev.preventDefault();
+              clearPendingDatePrefix();
+              armStatePrefix('t');
+              return;
+            }
+            if (k === 's' || k === 'S') {
+              ev.preventDefault();
+              clearPendingStatePrefix();
+              armDatePrefix('s');
+              return;
+            }
+          }
+
+          if (!ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+            if (ev.key === 'n') {
+              ev.preventDefault();
+              createFileInline();
+              return;
+            }
+            if (ev.key === 'N') {
+              ev.preventDefault();
+              createFolderPrompt();
+              return;
+            }
+            if (ev.key === 'e') {
+              ev.preventDefault();
+              if (meta.type === 'project') addRootInline(meta.file);
+              else if (meta.type === 'task') addNearInline(id, 'sibling');
+              return;
+            }
+            if (ev.key === 'E') {
+              ev.preventDefault();
+              if (meta.type === 'project') addRootInline(meta.file);
+              else if (meta.type === 'task') addNearInline(id, 'child');
+              return;
+            }
+            if (ev.key === 'd' || ev.key === 'D') {
+              ev.preventDefault();
+              if (meta.type === 'project') {
+                deleteProjectFileByHotkey(meta.file);
+              } else if (meta.type === 'task') {
+                deleteTask(id);
+              }
+              return;
+            }
+          }
+
+          if (ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            moveSelection(-1);
+            return;
+          }
+          if (ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            moveSelection(1);
+            return;
+          }
+          if (ev.key === 'ArrowLeft') {
+            ev.preventDefault();
+            if (meta.type === 'project') {
+              if (meta.open) toggleProject(meta.file);
+              else if (meta.parentId && visibleTaskMeta.has(meta.parentId)) selectTask(meta.parentId, true);
+              return;
+            }
+            if (meta.type === 'folder') {
+              if (meta.open) toggleFolder(meta.folder);
+              return;
+            }
+            if (meta.hasChild && meta.open) {
+              toggleNode(id);
+            } else if (meta.parentId && visibleTaskMeta.has(meta.parentId)) {
+              selectTask(meta.parentId, true);
+            }
+            return;
+          }
+          if (ev.key === 'ArrowRight') {
+            ev.preventDefault();
+            if (meta.type === 'project') {
+              if (!meta.open) {
+                toggleProject(meta.file);
+              } else if (meta.firstChildId && visibleTaskMeta.has(meta.firstChildId)) {
+                selectTask(meta.firstChildId, true);
+              }
+              return;
+            }
+            if (meta.type === 'folder') {
+              if (!meta.open) {
+                toggleFolder(meta.folder);
+              } else if (meta.firstChildId && visibleTaskMeta.has(meta.firstChildId)) {
+                selectTask(meta.firstChildId, true);
+              }
+              return;
+            }
+            if (meta.hasChild && !meta.open) {
+              toggleNode(id);
+            } else if (meta.firstChildId && visibleTaskMeta.has(meta.firstChildId)) {
+              selectTask(meta.firstChildId, true);
+            }
+            return;
+          }
+          if (ev.altKey && ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            jumpLevel(-1);
+            return;
+          }
+          if (ev.altKey && ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            jumpLevel(1);
+            return;
+          }
+          if (ev.key === 'Home') {
+            ev.preventDefault();
+            if (visibleTaskOrder.length) selectTask(visibleTaskOrder[0], true);
+            return;
+          }
+          if (ev.key === 'End') {
+            ev.preventDefault();
+            if (visibleTaskOrder.length) selectTask(visibleTaskOrder[visibleTaskOrder.length - 1], true);
+            return;
+          }
+          if (ev.key === 'Tab') {
+            ev.preventDefault();
+            if (meta.type === 'project') {
+              if (meta.hasChild) toggleProject(meta.file);
+            } else if (meta.type === 'folder') {
+              if (meta.hasChild) toggleFolder(meta.folder);
+            } else if (meta.hasChild) {
+              toggleNode(id);
+            }
+            return;
+          }
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            if (meta.type === 'project') {
+              if (meta.hasChild) toggleProject(meta.file);
+            } else if (meta.type === 'folder') {
+              if (meta.hasChild) toggleFolder(meta.folder);
+            } else {
+              startInlineEdit(id);
+            }
+            return;
+          }
+          if (ev.key === ' ' || ev.code === 'Space' || ev.key === 'Spacebar') {
+            ev.preventDefault();
+            if (meta.type !== 'task') return;
+            const nextState = cycleState(meta.state, ev.shiftKey);
+            setState(id, nextState, true);
+            return;
+          }
+          if (ev.key === 'Delete') {
+            ev.preventDefault();
+            if (meta.type === 'project') {
+              deleteProjectFileByHotkey(meta.file);
+              return;
+            }
+            if (meta.type !== 'task') return;
+            deleteTask(id);
+            return;
+          }
+          if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && String(ev.key || '').toLowerCase() === 'z') {
+            ev.preventDefault();
+            undoDelete();
+            return;
+          }
+        }
+
+        document.getElementById('taskTree').addEventListener('keydown', handleTreeKeydown);
+        document.getElementById('taskTree').addEventListener('focusin', (ev) => {
+          const row = ev.target.closest('.task-row[data-task-id]');
+          if (!row) return;
+          const id = row.getAttribute('data-task-id');
+          if (id) selectTask(id, false);
+        });
+
+        const taskSearchInput = document.getElementById('taskSearch');
+        if (taskSearchInput) {
+          taskSearchInput.addEventListener('input', (ev) => {
+            taskSearch = String(ev.target.value || '').trim().toLowerCase();
+            selectedTaskId = null;
+            renderTree();
+          });
+        }
+
+        const qFileSel = document.getElementById('q-file');
+        if (qFileSel) {
+          qFileSel.addEventListener('change', () => {
+            const file = qFileSel.value;
+            if (!file) return;
+            COLLAPSED.delete(projectKey(file));
+            const pf = parentFolderOfFile(file);
+            if (pf) COLLAPSED.delete(folderKey(pf));
+            selectedTaskId = projectKey(file);
+            shouldRestoreTaskFocus = true;
+            renderTree();
+          });
+        }
+
+        const dateModalInput = document.getElementById('dateModalInput');
+        const dateModalPicker = document.getElementById('dateModalPicker');
+        if (dateModalPicker && dateModalInput) {
+          dateModalPicker.addEventListener('change', () => {
+            if (dateModalPicker.value) dateModalInput.value = dateModalPicker.value;
+          });
+        }
+        if (dateModalInput) {
+          dateModalInput.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') {
+              ev.preventDefault();
+              saveDateEditor();
+              return;
+            }
+            if (ev.key === 'Escape') {
+              ev.preventDefault();
+              closeDateEditor();
+              return;
+            }
+          });
+        }
+
+        initTheme();
+        refreshData().catch(e => { const el = document.getElementById('reportOut'); el.className='report-empty'; el.textContent = 'Error: ' + e; });
+      </script>
+    </body>
+    </html>"""
+    build_stamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    html_page = (
+        html_page.replace("{{", "{")
+        .replace("}}", "}")
+        .replace("__SHARED_HEADER_CSS__", _shared_gtd_header_css())
+        .replace("__SHARED_HEADER_HTML__", _shared_gtd_header_html())
+        .replace("__BUILD_STAMP__", build_stamp)
+    )
+    return HTMLResponse(html_page)
+
