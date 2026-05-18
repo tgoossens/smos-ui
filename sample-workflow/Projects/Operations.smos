@@ -1,18 +1,20 @@
 version: 2.0.0
 value:
-  - entry:
-      header: "Operations"
-      contents: "Keep recurring operational work visible"
-    forest:
-      - entry:
-          header: "Rotate API keys in staging"
-        state-history:
-          - state: TODO
-            time: 2026-05-17 07:45:00
-      - entry:
-          header: "Validate backup restore drill"
-        state-history:
-          - state: READY
-            time: 2026-05-17 07:40:00
-        timestamps:
-          SCHEDULED: 2026-05-19
+- entry:
+    header: Operations
+    contents: Keep recurring operational work visible
+  forest:
+  - header: Rotate API keys in staging
+    state-history:
+    - state: TODO
+      time: 2026-05-17 07:45:00
+    timestamps:
+      DEADLINE: 2026-05-30
+      SCHEDULED: 2026-05-25
+  - header: Validate backup restore drill
+    state-history:
+    - state: READY
+      time: 2026-05-17 07:40:00
+    timestamps:
+      SCHEDULED: 2026-05-19
+      DEADLINE: '2026-06-01'

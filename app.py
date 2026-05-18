@@ -263,17 +263,60 @@ def _normalize_state_history(hist: Any) -> list[dict]:
     return [item for _, __, ___, item in decorated]
 
 
+def _promote_leaf_to_tree_node(node: dict) -> dict:
+    """Convert leaf-style entry fields into canonical tree shape with `entry` map."""
+    entry = node.get("entry")
+    if isinstance(entry, dict):
+        return entry
+
+    entry_map: dict[str, Any] = {}
+    if isinstance(entry, str) and entry.strip():
+        entry_map["header"] = entry.strip()
+
+    for k in ("header", "contents", "timestamps", "properties", "state-history", "history", "tags", "logbook"):
+        if k in node:
+            entry_map[k] = node.pop(k)
+
+    node["entry"] = entry_map
+    return node["entry"]
+
+
+def _node_entry_dict(node: dict, create: bool = False) -> dict:
+    """Return the map where smos entry fields live.
+
+    Supports both valid shapes:
+    - Tree node: {entry: {...}, forest: [...]}
+    - Leaf entry: {header: ..., timestamps: ..., ...}
+    """
+    entry = node.get("entry")
+    if isinstance(entry, dict):
+        return entry
+    if isinstance(entry, str):
+        if create:
+            return _promote_leaf_to_tree_node(node)
+        return {"header": entry}
+
+    # If this node already has children, canonical shape is tree wrapper.
+    if create and isinstance(node.get("forest"), list):
+        return _promote_leaf_to_tree_node(node)
+
+    # Otherwise, leaf-style top-level entry fields.
+    return node
+
+
 def _node_header(node: dict) -> str:
-    if isinstance(node.get("entry"), dict):
-        return str(node["entry"].get("header") or "").strip()
-    if isinstance(node.get("entry"), str):
-        return str(node.get("entry") or "").strip()
+    entry = node.get("entry")
+    if isinstance(entry, dict):
+        return str(entry.get("header") or "").strip()
+    if isinstance(entry, str):
+        return str(entry or "").strip()
     return str(node.get("header") or "").strip()
 
 
 def _node_contents(node: dict) -> str:
-    if isinstance(node.get("entry"), dict):
-        return str(node["entry"].get("contents") or "")
+    entry = node.get("entry")
+    if isinstance(entry, dict):
+        return str(entry.get("contents") or "")
     return str(node.get("contents") or "")
 
 
@@ -281,66 +324,82 @@ def _node_forest(node: dict) -> list:
     forest = node.get("forest")
     if isinstance(forest, list):
         return forest
+
+    # A node with children should be a tree wrapper with explicit `entry`.
+    _promote_leaf_to_tree_node(node)
     node["forest"] = []
     return node["forest"]
 
 
 def _node_timestamps(node: dict) -> dict:
-    ts = node.get("timestamps")
+    entry = _node_entry_dict(node, create=True)
+    ts = entry.get("timestamps")
     if isinstance(ts, dict):
         return ts
-    node["timestamps"] = {}
-    return node["timestamps"]
+    entry["timestamps"] = {}
+    return entry["timestamps"]
 
 
 def _node_properties(node: dict) -> dict:
-    props = node.get("properties")
+    entry = _node_entry_dict(node, create=True)
+    props = entry.get("properties")
     if isinstance(props, dict):
         return props
-    node["properties"] = {}
-    return node["properties"]
+    entry["properties"] = {}
+    return entry["properties"]
+
+
+def _normalize_smos_payload(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    if "version" not in payload:
+        payload["version"] = "2.0.0"
+
+    root = payload.get("value")
+    if not isinstance(root, list):
+        root = []
+        payload["value"] = root
+
+    return payload
 
 
 def _set_node_header(node: dict, value: str) -> None:
-    if isinstance(node.get("entry"), dict):
-        node["entry"]["header"] = value
-    elif isinstance(node.get("entry"), str):
-        node["entry"] = value
-    else:
-        node["header"] = value
+    entry = _node_entry_dict(node, create=True)
+    entry["header"] = value
 
 
 def _set_node_contents(node: dict, value: str) -> None:
-    if isinstance(node.get("entry"), dict):
-        node["entry"]["contents"] = value
-    elif isinstance(node.get("entry"), str):
-        node["entry"] = {"header": node.get("entry") or "", "contents": value}
+    entry = _node_entry_dict(node, create=True)
+    if value:
+        entry["contents"] = value
     else:
-        node["contents"] = value
+        entry.pop("contents", None)
 
 
 def _set_node_state(node: dict, state: str) -> None:
     raw_state = (state or "").strip().upper()
+    entry = _node_entry_dict(node, create=True)
     if raw_state in SMOS_NO_STATE_SENTINELS:
-        node.pop("state-history", None)
+        entry.pop("state-history", None)
         return
 
     canonical = _normalize_smos_state(raw_state)
-    hist = _normalize_state_history(node.get("state-history"))
-    node["state-history"] = hist
+    hist = _normalize_state_history(entry.get("state-history"))
+    entry["state-history"] = hist
     if hist and _normalize_smos_state(hist[0].get("state")) == canonical:
         return
     hist.insert(0, {"state": canonical, "time": _smos_now_timestamp()})
 
 
 def _set_node_timestamp(node: dict, key: str, value: str | None) -> None:
+    entry = _node_entry_dict(node, create=True)
     ts = _node_timestamps(node)
     if value:
         ts[key] = value
     else:
         ts.pop(key, None)
     if not ts:
-        node.pop("timestamps", None)
+        entry.pop("timestamps", None)
 
 
 def _safe_rel_folder_path(raw: str) -> str:
@@ -399,7 +458,8 @@ def _scan_smos_folders(workflow_dir: Path) -> list[str]:
 
 
 def _current_smos_state(node: dict) -> str:
-    hist = _normalize_state_history(node.get("state-history"))
+    entry = _node_entry_dict(node, create=False)
+    hist = _normalize_state_history(entry.get("state-history"))
     if hist:
         return _normalize_smos_state(hist[0].get("state"))
     return ""
@@ -451,12 +511,8 @@ def _load_smos_file_for_update(rel_file: str) -> tuple[Path, dict, list]:
     payload = yaml.safe_load(fp.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         raise ValueError("invalid smos file")
-    root = payload.get("value")
-    if not isinstance(root, list):
-        root = []
-        payload["value"] = root
-    if "version" not in payload:
-        payload["version"] = "2.0.0"
+    payload = _normalize_smos_payload(payload)
+    root = payload.get("value") or []
     return fp, payload, root
 
 
@@ -465,9 +521,9 @@ def _new_smos_node(payload: dict) -> dict:
     if not header:
         raise ValueError("header is required")
     contents = str(payload.get("contents") or "").strip()
-    node: dict[str, Any] = {"entry": {"header": header}}
+    node: dict[str, Any] = {"header": header}
     if contents:
-        node["entry"]["contents"] = contents
+        node["contents"] = contents
 
     raw_state = str(payload.get("state") or "TODO").strip().upper()
     if raw_state not in SMOS_NO_STATE_SENTINELS:
@@ -509,13 +565,14 @@ def _flatten_nodes(rel_file: str, nodes: list, parent: list[int] | None = None, 
             continue
         path = parent + [idx]
         task_id = _task_id(rel_file, path)
-        ts = node.get("timestamps") if isinstance(node.get("timestamps"), dict) else {}
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        entry = _node_entry_dict(node, create=False)
+        ts = entry.get("timestamps") if isinstance(entry.get("timestamps"), dict) else {}
+        props = entry.get("properties") if isinstance(entry.get("properties"), dict) else {}
         state = _current_smos_state(node)
         due = _parse_ymd(ts.get("DEADLINE"))
         scheduled = _parse_ymd(ts.get("SCHEDULED"))
 
-        children = _node_forest(node)
+        children = node.get("forest") if isinstance(node.get("forest"), list) else []
         out.append(
             {
                 "id": task_id,
@@ -529,7 +586,7 @@ def _flatten_nodes(rel_file: str, nodes: list, parent: list[int] | None = None, 
                 "scheduled": scheduled,
                 "owner": str(props.get("owner") or "").strip(),
                 "context": str(props.get("context") or "").strip(),
-                "tags": node.get("tags") if isinstance(node.get("tags"), list) else [],
+                "tags": entry.get("tags") if isinstance(entry.get("tags"), list) else [],
                 "parent_id": _task_id(rel_file, parent) if parent else None,
                 "has_children": bool(children),
                 "terminal": state in SMOS_TERMINAL_STATES,
@@ -753,18 +810,42 @@ def _native_report(kind: str) -> str:
     else:
         return "Unknown report kind"
 
-    rows.sort(key=lambda x: (x.get("due") or "9999-12-31", x.get("file") or "", x.get("header") or ""))
+    rows.sort(
+        key=lambda x: (
+            x.get("due") or x.get("scheduled") or "9999-12-31",
+            x.get("scheduled") or "9999-12-31",
+            x.get("file") or "",
+            x.get("header") or "",
+        )
+    )
 
     lines = [title, "", f"Total: {len(rows)}", ""]
     today = date.today().isoformat()
     for item in rows:
-        due = item.get("due") or "-"
-        overdue = " !OVERDUE" if due != "-" and due < today and item["state"] not in SMOS_TERMINAL_STATES else ""
-        lines.append(f"[{item['state'] or '-'}] {item['file']} | due={due}{overdue} | {item['header']}")
+        due = item.get("due") or ""
+        scheduled = item.get("scheduled") or ""
+        parts: list[str] = []
+        if scheduled:
+            parts.append(f"SCHEDULED {scheduled}")
+        if due:
+            overdue = " !OVERDUE" if due < today and item["state"] not in SMOS_TERMINAL_STATES else ""
+            parts.append(f"DEADLINE {due}{overdue}")
+        date_part = " ".join(parts) if parts else "NO-DATE"
+        lines.append(f"[{item['state'] or '-'}] {date_part} {item['header']} ({item['file']})")
 
     if len(lines) <= 4:
         lines.append("(no items)")
     return "\n".join(lines)
+
+
+def _clean_report_text(raw: str) -> str:
+    text = str(raw or "")
+    # Remove ANSI control sequences and stray SGR codes.
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"(?:\x1b)?\[[0-9;]*m", "", text)
+    # Remove remaining non-printable control chars (keep newlines/tabs).
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return text.strip()
 
 
 def _run_smos_report(kind: str) -> tuple[int, str]:
@@ -794,24 +875,16 @@ def _run_smos_report(kind: str) -> tuple[int, str]:
     env["NO_COLOR"] = "1"
 
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(APP_ROOT), env=env)
-    text = (res.stdout or "").strip()
+    text = _clean_report_text(res.stdout or "")
     if not text and res.stderr:
-        text = (res.stderr or "").strip()
+        text = _clean_report_text(res.stderr or "")
     return res.returncode, text
 
 
 def _render_report(kind: str) -> str:
-    mode, mode_reason = _effective_mode()
-    if mode == "smos":
-        rc, out = _run_smos_report(kind)
-        if rc == 0:
-            return out or "(empty report output)"
-        native = _native_report(kind)
-        return (
-            f"smos-query failed (rc={rc}), using native fallback.\n"
-            f"Reason: {out or 'unknown error'}\n\n"
-            f"{native}"
-        )
+    # Keep report rendering consistent across smos/native modes.
+    # smos-query remains optional for capabilities/diagnostics, but UI report text
+    # uses the same normalized format everywhere.
     return _native_report(kind)
 
 
@@ -1459,9 +1532,9 @@ async def gtd_view() -> HTMLResponse:
         .task-header:hover {{ color:var(--accent); }}
         .task-edit-input {{ max-width:520px; font-size:14px; padding:6px 8px; }}
         .task-meta {{ font-size:11px; color:var(--muted); white-space:nowrap; }}
-        .task-date-pill {{ font-size:11px; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-weight:700; }}
-        .task-date-pill.deadline {{ border-color:#ef4444; color:#ef4444; }}
-        .task-date-pill.scheduled {{ border-color:#f59e0b; color:#f59e0b; }}
+        .task-date-pill {{ font-size:11px; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-weight:700; display:inline-block; }}
+        .task-date-pill.deadline {{ border-color:#ef4444; color:#ef4444; background:rgba(239,68,68,.12); }}
+        .task-date-pill.scheduled {{ border-color:#f59e0b; color:#f59e0b; background:rgba(245,158,11,.12); }}
         .task-actions {{ display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }}
         .mobile-tools {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }}
         .task-search {{ max-width:320px; }}
@@ -1502,7 +1575,7 @@ async def gtd_view() -> HTMLResponse:
         .report-row:last-child {{ border-bottom:none; }}
         .report-title {{ font-size:13px; color:var(--text); }}
         .report-meta {{ margin-top:4px; font-size:11px; color:var(--muted); display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
-        .report-state-chip {{ font-size:11px; border-radius:999px; padding:2px 8px; color:#111; font-weight:700; border:1px solid rgba(0,0,0,.18); }}
+        .report-state-chip {{ font-size:11px; border-radius:999px; padding:2px 8px; color:#111; font-weight:700; border:1px solid rgba(0,0,0,.18); display:inline-block; }}
         .report-text {{ border:1px solid var(--line); border-radius:10px; padding:8px 10px; background:#0f141d; max-height:300px; overflow:auto; }}
         .report-line {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.45; color:#d9e7ff; padding:2px 0; white-space:pre-wrap; word-break:break-word; }}
         .report-gap {{ height:6px; }}
@@ -1961,6 +2034,14 @@ async def gtd_view() -> HTMLResponse:
         function parentFolderOfFile(file) {
           const parts = String(file || '').split('/').filter(Boolean);
           return parts.length > 1 ? parts[0] : '';
+        }
+
+        function firstFileInFolder(folder) {
+          const files = (DATA.projects || [])
+            .map(p => p.file)
+            .filter(f => parentFolderOfFile(f) === folder)
+            .sort((a,b) => a.localeCompare(b));
+          return files.length ? files[0] : null;
         }
 
         function taskIdFromPath(file, path) {
@@ -2940,11 +3021,21 @@ async def gtd_view() -> HTMLResponse:
           return lines.map((raw) => {
             if (!raw.trim()) return "<div class='report-gap'></div>";
             let line = esc(raw);
-            line = line.replace(/\\b(TODO|NEXT|WAITING|DONE|CANCELLED|FAILED|READY|STARTED)\\b/g, (m) => {
-              return `<span class='report-state-chip ${reportStateClass(m)}'>${m}</span>`;
+
+            // Preserve bracketed report state style: [NEXT], [READY], ...
+            line = line.replace(/\[(TODO|NEXT|WAITING|DONE|CANCELLED|FAILED|READY|STARTED)\]|\b(TODO|NEXT|WAITING|DONE|CANCELLED|FAILED|READY|STARTED)\b/g, (_, s1, s2) => {
+              const s = s1 || s2;
+              const chip = `<span class='report-state-chip ${reportStateClass(s)}'>${s}</span>`;
+              return s1 ? `[${chip}]` : chip;
             });
-            line = line.replace(/\\bDEADLINE\\b(?:\\s+\\d{4}-\\d{2}-\\d{2})?/g, (m) => `<span class='task-date-pill deadline'>${m}</span>`);
-            line = line.replace(/\\bSCHEDULED\\b(?:\\s+\\d{4}-\\d{2}-\\d{2})?/g, (m) => `<span class='task-date-pill scheduled'>${m}</span>`);
+
+            // Date ribbons (accept DEADLINE/SCHEDULED with optional :/= and date)
+            line = line.replace(/\b(DEADLINE|SCHEDULED)(?:\s*[:=]\s*|\s+)(\d{4}-\d{2}-\d{2})(!?\s*OVERDUE)?\b/g, (_, label, d, overdue) => {
+              const cls = label === 'DEADLINE' ? 'deadline' : 'scheduled';
+              const suffix = overdue ? ` ${overdue.trim()}` : '';
+              return `<span class='task-date-pill ${cls}'>${label} ${d}${suffix}</span>`;
+            });
+
             return `<div class='report-line'>${line}</div>`;
           }).join('');
         }
