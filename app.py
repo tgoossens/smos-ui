@@ -512,7 +512,12 @@ def _load_smos_file_for_update(rel_file: str) -> tuple[Path, dict, list]:
     if not isinstance(payload, dict):
         raise ValueError("invalid smos file")
     payload = _normalize_smos_payload(payload)
-    root = payload.get("value") or []
+    root = payload.get("value")
+    if root is None:
+        root = []
+        payload["value"] = root
+    elif not isinstance(root, list):
+        raise ValueError("invalid smos file")
     return fp, payload, root
 
 
@@ -1679,7 +1684,7 @@ async def gtd_view() -> HTMLResponse:
             <div class='task-tree' id='taskTree'></div>
 
             <div class='keyboard-hint'>
-              Keyboard: ↑/↓ move, ←/→ collapse/expand or parent/child, TAB fold/unfold subtree, SPACE cycle state (incl. no-state), tw WAITING, td DONE, tn NEXT, tt TODO, tr READY, tc CANCELLED, sd DEADLINE date, ss SCHEDULED date (accept YYYY-MM-DD or +1d/+1w/+1m), e new sibling (or root on project row), E new child (or root on project row), n new .smos file (inline), N new folder, d/Del delete task (or delete selected .smos file when on project row, with confirmation), Esc cancels new inline creation, Ctrl+Z undo delete, Alt+↑/Alt+↓ jump between levels, Home/End go top/bottom.
+              Keyboard: ↑/↓ move, ←/→ collapse/expand or parent/child, TAB fold/unfold subtree, SPACE cycle state (incl. no-state), tw WAITING, td DONE, tn NEXT, tt TODO, tr READY, tc CANCELLED, sd DEADLINE date, ss SCHEDULED date (accept YYYY-MM-DD or +1d/+1w/+1m), e new root entry in active file, E new child (or root on project row), n new .smos file (inline), N new folder, d/Del delete task (or delete selected .smos file when on project row, with confirmation), Esc cancels new inline creation, Ctrl+Z undo delete, Alt+↑/Alt+↓ jump between levels, Home/End go top/bottom.
             </div>
           </div>
 
@@ -2310,7 +2315,14 @@ async def gtd_view() -> HTMLResponse:
 
         function fillFiles() {
           const sel = document.getElementById('q-file');
+          if (!sel) return;
+          const prev = String(sel.value || '').trim();
           sel.innerHTML = DATA.files.map(f => `<option value='${esc(f)}'>${esc(f)}</option>`).join('');
+          if (prev && Array.isArray(DATA.files) && DATA.files.includes(prev)) {
+            sel.value = prev;
+          } else if (Array.isArray(DATA.files) && DATA.files.length) {
+            sel.value = DATA.files[0];
+          }
         }
 
         function jumpToFile() {
@@ -2760,7 +2772,13 @@ async def gtd_view() -> HTMLResponse:
           selectedTaskId = id;
           const meta = visibleTaskMeta.get(id);
           const fileSel = document.getElementById('q-file');
-          if (meta && meta.file && fileSel) fileSel.value = meta.file;
+          if (fileSel) {
+            if (meta && meta.file) fileSel.value = meta.file;
+            else if (meta && meta.type === 'folder' && meta.folder) {
+              const first = firstFileInFolder(String(meta.folder));
+              if (first) fileSel.value = first;
+            }
+          }
           const root = document.getElementById('taskTree');
           if (root) {
             for (const row of root.querySelectorAll('.task-row[data-task-id]')) {
@@ -3059,13 +3077,47 @@ async def gtd_view() -> HTMLResponse:
           }
         }
 
+        function isTypingTarget(target) {
+          const el = target && target.nodeType === 1 ? target : null;
+          if (!el) return false;
+          if (el.closest('.date-modal-backdrop.open')) return true;
+          if (el.closest('input, textarea, select, [contenteditable="true"]')) return true;
+          return false;
+        }
+
+        function hasActiveInlineEditor() {
+          if (editingTaskId) {
+            const taskInput = document.getElementById(`inline-edit-${editingTaskId}`);
+            if (taskInput) return true;
+            editingTaskId = null;
+            pendingNewTaskId = null;
+            inlineEditSaving = false;
+          }
+          if (editingProjectFile) {
+            const projectInput = document.getElementById(projectInputId(editingProjectFile));
+            if (projectInput) return true;
+            editingProjectFile = null;
+            pendingNewFile = null;
+            inlineProjectEditSaving = false;
+          }
+          return false;
+        }
+
         function handleTreeKeydown(ev) {
-          if (editingTaskId || editingProjectFile) return;
-          const row = ev.target.closest('.task-row[data-task-id]');
-          if (!row) return;
-          const id = row.getAttribute('data-task-id');
-          if (!id) return;
-          selectTask(id, false);
+          if (ev.defaultPrevented) return;
+          if (isTypingTarget(ev.target)) return;
+          if (hasActiveInlineEditor()) return;
+          const row = ev.target.closest ? ev.target.closest('.task-row[data-task-id]') : null;
+          let id = row ? row.getAttribute('data-task-id') : '';
+          if (id) {
+            selectTask(id, false);
+          } else {
+            id = selectedTaskId && visibleTaskMeta.has(selectedTaskId)
+              ? selectedTaskId
+              : (visibleTaskOrder[0] || '');
+            if (!id) return;
+            selectTask(id, false);
+          }
 
           const meta = visibleTaskMeta.get(id);
           if (!meta) return;
@@ -3112,20 +3164,27 @@ async def gtd_view() -> HTMLResponse:
           }
 
           if (!ev.ctrlKey && !ev.metaKey && !ev.altKey) {
-            if (ev.key === 'n') {
+            if (ev.key === 'n' || ev.key === 'N') {
               ev.preventDefault();
-              createFileInline();
-              return;
-            }
-            if (ev.key === 'N') {
-              ev.preventDefault();
-              createFolderPrompt();
+              if (ev.key === 'N' && ev.shiftKey) {
+                createFolderPrompt();
+              } else {
+                createFileInline();
+              }
               return;
             }
             if (ev.key === 'e') {
               ev.preventDefault();
-              if (meta.type === 'project') addRootInline(meta.file);
-              else if (meta.type === 'task') addNearInline(id, 'sibling');
+              let activeFile = '';
+              if (meta && meta.file) {
+                activeFile = String(meta.file).trim();
+              } else if (meta && meta.type === 'folder' && meta.folder) {
+                activeFile = firstFileInFolder(String(meta.folder));
+              } else {
+                const fileSel = document.getElementById('q-file');
+                activeFile = (fileSel && fileSel.value) ? String(fileSel.value).trim() : '';
+              }
+              if (activeFile) addRootInline(activeFile);
               return;
             }
             if (ev.key === 'E') {
@@ -3265,6 +3324,7 @@ async def gtd_view() -> HTMLResponse:
         }
 
         document.getElementById('taskTree').addEventListener('keydown', handleTreeKeydown);
+        document.addEventListener('keydown', handleTreeKeydown);
         document.getElementById('taskTree').addEventListener('focusin', (ev) => {
           const row = ev.target.closest('.task-row[data-task-id]');
           if (!row) return;
@@ -3331,4 +3391,3 @@ async def gtd_view() -> HTMLResponse:
         .replace("__BUILD_STAMP__", build_stamp)
     )
     return HTMLResponse(html_page)
-
